@@ -1,52 +1,50 @@
+use serde_json::json;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 
-fn git(cwd: Option<&Path>, args: &[&str]) -> String {
-    let mut command = Command::new("git");
+fn run(cwd: Option<&Path>, args: &[&str]) -> Output {
+    let mut command = Command::new(args[0]);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.args(args).output().expect("start git");
+    let output = command.args(&args[1..]).output().expect("start command");
     assert!(
         output.status.success(),
-        "git {} failed: {}",
+        "{} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    output
 }
 
-fn git_owned(cwd: Option<&Path>, args: Vec<String>) -> String {
-    let mut command = Command::new("git");
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    let output = command.args(&args).output().expect("start git");
-    assert!(
-        output.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+fn git(cwd: Option<&Path>, args: &[&str]) -> String {
+    String::from_utf8_lossy(&run(cwd, args).stdout)
+        .trim()
+        .to_owned()
 }
 
 fn push_ref(work: &Path, remote: &Path, source: &str, destination: &str) {
-    git_owned(
-        Some(work),
-        vec![
-            "push".into(),
-            "--quiet".into(),
-            remote.display().to_string(),
-            format!("{source}:{destination}"),
-        ],
-    );
+    let remote = remote.to_str().unwrap();
+    let refspec = format!("{source}:{destination}");
+    run(Some(work), &["git", "push", "--quiet", remote, &refspec]);
+}
+
+fn remote_oid(remote: &Path, reference: &str) -> Option<String> {
+    let remote = remote.to_str().unwrap();
+    let output = Command::new("git")
+        .args(["--git-dir", remote, "rev-parse", "--verify", reference])
+        .output()
+        .expect("start git");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn write_manifest(state: &Path, remote: &Path) {
     fs::create_dir_all(state).unwrap();
-    let manifest = serde_json::json!({
+    let manifest = json!({
         "schema_version": 1,
         "remote": remote.display().to_string(),
         "generated_unix": 0,
@@ -62,89 +60,70 @@ fn write_manifest(state: &Path, remote: &Path) {
     .unwrap();
 }
 
-fn remote_branch_exists(remote: &Path, branch: &str) -> bool {
-    let mut command = Command::new("git");
-    let output = command
-        .args([
-            "--git-dir",
-            remote.to_str().unwrap(),
-            "show-ref",
-            "--verify",
-            &format!("refs/heads/{branch}"),
-        ])
-        .output()
-        .expect("start git");
-    output.status.success()
-}
-
 #[test]
-fn dedupe_deletes_exact_managed_aliases_and_keeps_other_branches() {
+fn dedupe_retains_unowned_and_different_oid_branches() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote.git");
     let work = temp.path().join("work");
     let state = temp.path().join("state");
 
-    git(
+    run(
         None,
-        &["init", "--bare", "--quiet", remote.to_str().unwrap()],
+        &["git", "init", "--bare", "--quiet", remote.to_str().unwrap()],
     );
-    git(
-        None,
-        &["init", "--quiet", "-b", "main", work.to_str().unwrap()],
-    );
-    git(Some(&work), &["config", "user.name", "dedupe fixture"]);
-    git(
-        Some(&work),
-        &["config", "user.email", "dedupe@example.invalid"],
-    );
-    fs::write(work.join("base.txt"), "base\n").unwrap();
-    git(Some(&work), &["add", "base.txt"]);
-    git(Some(&work), &["commit", "--quiet", "-m", "base"]);
-    push_ref(&work, &remote, "HEAD", "refs/heads/main");
-    push_ref(&work, &remote, "HEAD", "refs/heads/master");
-    push_ref(&work, &remote, "HEAD", "refs/heads/default");
-    push_ref(
-        &work,
-        &remote,
-        "HEAD",
-        "refs/heads/recovery/find-and-recovery/base-alias",
-    );
-    git(
+    run(
         None,
         &[
-            "--git-dir",
-            remote.to_str().unwrap(),
-            "symbolic-ref",
-            "HEAD",
-            "refs/heads/default",
+            "git",
+            "init",
+            "--quiet",
+            "-b",
+            "main",
+            work.to_str().unwrap(),
         ],
     );
-
-    // Same committed tree and ancestry do not prove exact branch duplication.
-    git(Some(&work), &["checkout", "--quiet", "-b", "history-work"]);
-    fs::write(work.join("same.txt"), "same tree\n").unwrap();
-    git(Some(&work), &["add", "same.txt"]);
-    git(Some(&work), &["commit", "--quiet", "-m", "short history"]);
-    push_ref(&work, &remote, "HEAD", "refs/heads/topic/short");
-    git(
+    run(
         Some(&work),
-        &["commit", "--quiet", "--allow-empty", "-m", "long history"],
+        &["git", "config", "user.name", "dedupe fixture"],
     );
-    push_ref(&work, &remote, "HEAD", "refs/heads/topic/long");
+    run(
+        Some(&work),
+        &["git", "config", "user.email", "dedupe@example.invalid"],
+    );
+    fs::write(work.join("base.txt"), "base\n").unwrap();
+    run(Some(&work), &["git", "add", "base.txt"]);
+    run(Some(&work), &["git", "commit", "--quiet", "-m", "base"]);
+    push_ref(&work, &remote, "HEAD", "refs/heads/main");
+    let base_oid = git(Some(&work), &["git", "rev-parse", "HEAD"]);
+    for branch in ["master", "default", "recovery/alias"] {
+        push_ref(&work, &remote, "HEAD", &format!("refs/heads/{branch}"));
+    }
 
-    // These tips have identical content but unrelated commits.
-    git(Some(&work), &["checkout", "--quiet", "main"]);
-    git(Some(&work), &["checkout", "--quiet", "-b", "divergent-a"]);
-    fs::write(work.join("divergent.txt"), "same content\n").unwrap();
-    git(Some(&work), &["add", "divergent.txt"]);
-    git(Some(&work), &["commit", "--quiet", "-m", "divergent A"]);
-    push_ref(&work, &remote, "HEAD", "refs/heads/topic/divergent-a");
-    git(Some(&work), &["checkout", "--quiet", "main"]);
-    git(Some(&work), &["checkout", "--quiet", "-b", "divergent-b"]);
-    fs::write(work.join("divergent.txt"), "same content\n").unwrap();
-    git(Some(&work), &["add", "divergent.txt"]);
-    git(Some(&work), &["commit", "--quiet", "-m", "divergent B"]);
-    push_ref(&work, &remote, "HEAD", "refs/heads/topic/divergent-b");
+    run(
+        Some(&work),
+        &["git", "checkout", "--quiet", "-b", "history"],
+    );
+    fs::write(work.join("same.txt"), "same tree\n").unwrap();
+    run(Some(&work), &["git", "add", "same.txt"]);
+    run(
+        Some(&work),
+        &["git", "commit", "--quiet", "-m", "short history"],
+    );
+    let short_oid = git(Some(&work), &["git", "rev-parse", "HEAD"]);
+    push_ref(&work, &remote, "HEAD", "refs/heads/topic/short");
+    run(
+        Some(&work),
+        &[
+            "git",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "long history",
+        ],
+    );
+    let long_oid = git(Some(&work), &["git", "rev-parse", "HEAD"]);
+    push_ref(&work, &remote, "HEAD", "refs/heads/topic/long");
 
     write_manifest(&state, &remote);
     let output = Command::new(env!("CARGO_BIN_EXE_find-and-recovery"))
@@ -165,15 +144,32 @@ fn dedupe_deletes_exact_managed_aliases_and_keeps_other_branches() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    assert!(remote_branch_exists(&remote, "main"));
-    assert!(remote_branch_exists(&remote, "master"));
-    assert!(remote_branch_exists(&remote, "default"));
-    assert!(!remote_branch_exists(
-        &remote,
-        "recovery/find-and-recovery/base-alias"
-    ));
-    assert!(remote_branch_exists(&remote, "topic/short"));
-    assert!(remote_branch_exists(&remote, "topic/long"));
-    assert!(remote_branch_exists(&remote, "topic/divergent-a"));
-    assert!(remote_branch_exists(&remote, "topic/divergent-b"));
+    assert_eq!(
+        remote_oid(&remote, "refs/heads/main").as_deref(),
+        Some(base_oid.as_str())
+    );
+    for branch in ["master", "default", "recovery/alias"] {
+        assert_eq!(
+            remote_oid(&remote, &format!("refs/heads/{branch}")).as_deref(),
+            Some(base_oid.as_str())
+        );
+    }
+    assert_eq!(
+        remote_oid(&remote, "refs/heads/topic/short").as_deref(),
+        Some(short_oid.as_str())
+    );
+    assert_eq!(
+        remote_oid(&remote, "refs/heads/topic/long").as_deref(),
+        Some(long_oid.as_str())
+    );
+    for oid in [base_oid.as_str(), short_oid.as_str()] {
+        assert_eq!(
+            remote_oid(
+                &remote,
+                &format!("refs/archive/find-and-recovery/dedupe/{oid}")
+            )
+            .as_deref(),
+            None
+        );
+    }
 }
