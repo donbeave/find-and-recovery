@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     env, fs,
-    io::{self, Read},
+    io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
@@ -518,14 +518,18 @@ fn inventory_worktree(
     }
     wt.nested_repositories = nested;
     wt.index_tree = git(&p, &["write-tree"]).ok().map(|x| x.trim().to_owned());
-    if let Some(head) = &wt.head {
-        let td = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let index = td.path().join("index");
-        git_with_index(&p, &["read-tree", head], &index)?;
-        if git_with_index(&p, &["add", "-A", "-f", "--", "."], &index).is_ok() {
-            wt.worktree_tree = git_with_index(&p, &["write-tree"], &index)
-                .ok()
-                .map(|x| x.trim().to_owned());
+    // Ignored content blocks deletion. Do not materialize a forced snapshot
+    // merely to inventory it; large build/cache trees can be enormous.
+    if wt.ignored.is_empty() {
+        if let Some(head) = &wt.head {
+            let td = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let index = td.path().join("index");
+            git_with_index(&p, &["read-tree", head], &index)?;
+            if git_with_index(&p, &["add", "-A", "-f", "--", "."], &index).is_ok() {
+                wt.worktree_tree = git_with_index(&p, &["write-tree"], &index)
+                    .ok()
+                    .map(|x| x.trim().to_owned());
+            }
         }
     }
     wt.fingerprint = snapshot_fingerprint(wt);
@@ -1008,41 +1012,37 @@ fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
             .write_all(input.as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let mut data = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or("cat-file stdout unavailable")?
-        .read_to_end(&mut data)
-        .map_err(|e| e.to_string())?;
-    let status = child.wait().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("object scan incomplete".into());
-    }
-    let mut pos = 0usize;
-    while pos < data.len() {
-        let end = data[pos..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .ok_or("malformed cat-file header")?
-            + pos;
-        let h = String::from_utf8_lossy(&data[pos..end]).to_string();
-        pos = end + 1;
+    let stdout = child.stdout.take().ok_or("cat-file stdout unavailable")?;
+    let mut reader = BufReader::new(stdout);
+    let mut header = String::new();
+    loop {
+        header.clear();
+        if reader.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        let h = header.trim_end();
         let fields: Vec<_> = h.split_whitespace().collect();
         if fields.len() != 3 {
             return Err(format!("missing Git object {h}"));
         }
         let size: usize = fields[2].parse().map_err(|_| "bad object length")?;
-        if size > 16 * 1024 * 1024 {
-            return Err(format!("oversized blob blocks secret scan: {} bytes", size));
-        }
-        if pos + size > data.len() {
-            return Err("truncated object".into());
-        }
-        if r.is_match(&data[pos..pos + size]) {
+        let mut object = vec![0; size];
+        reader
+            .read_exact(&mut object)
+            .map_err(|_| "truncated object")?;
+        if r.is_match(&object) {
             return Err(format!("secret pattern in object {}", fields[0]));
         }
-        pos += size + 1;
+        let mut terminator = [0];
+        reader
+            .read_exact(&mut terminator)
+            .map_err(|_| "missing object terminator")?;
+        if terminator[0] != b'\n' {
+            return Err("malformed object terminator".into());
+        }
+    }
+    if !child.wait().map_err(|e| e.to_string())?.success() {
+        return Err("object scan incomplete".into());
     }
     Ok(())
 }
