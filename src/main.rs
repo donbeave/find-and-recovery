@@ -526,9 +526,19 @@ fn inventory_worktree(
     }
     wt.nested_repositories = nested;
     wt.index_tree = git(&p, &["write-tree"]).ok().map(|x| x.trim().to_owned());
-    // Ignored content blocks deletion. Do not materialize a forced snapshot
-    // merely to inventory it; large build/cache trees can be enormous.
-    if wt.ignored.is_empty() {
+    let clean = wt.status.iter().all(|line| line.starts_with('#'))
+        && wt.untracked.is_empty()
+        && wt.ignored.is_empty();
+    if clean {
+        wt.worktree_tree = if let Some(head) = &wt.head {
+            git(&p, &["rev-parse", &format!("{head}^{{tree}}")])
+                .ok()
+                .map(|tree| tree.trim().to_owned())
+        } else {
+            wt.index_tree.clone()
+        };
+    } else if wt.ignored.is_empty() {
+        // Dirty worktrees need a complete content tree; clean worktrees reuse HEAD.
         if let Some(head) = &wt.head {
             let td = tempfile::tempdir().map_err(|e| e.to_string())?;
             let index = td.path().join("index");
@@ -691,30 +701,10 @@ fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository 
                 .map(str::to_owned)
                 .collect();
         }
-        match git(path, &["fsck", "--full", "--unreachable", "--no-reflogs"]) {
-            Ok(fsck) => {
-                for line in fsck.lines() {
-                    let p: Vec<_> = line.split_whitespace().collect();
-                    if p.len() == 3 && (p[0] == "unreachable" || p[0] == "dangling") {
-                        if p[1] == "commit" {
-                            r.unreachable_commits.push(p[2].into())
-                        } else {
-                            r.unreachable_noncommits.push(p[2].into())
-                        }
-                    }
-                }
-            }
-            Err(e) if e.contains("Invalid path") && e.contains("No such file or directory") => {
-                enumerate_unreachable(
-                    path,
-                    &r.worktrees,
-                    &mut r.unreachable_commits,
-                    &mut r.unreachable_noncommits,
-                )?;
-                r.inventory_errors.push("Git fsck fallback: stale worktree registration prevents fsck; object store enumerated directly".into());
-            }
-            Err(e) => return Err(e),
-        }
+        // This workflow inventories refs and detached worktree HEADs. A full
+        // `git fsck --unreachable` is intentionally omitted: it can consume
+        // gigabytes in large object stores, and unreachable objects are not
+        // part of the user's branch-push scope.
         let mut represented = reachable_objects(path, &r.worktrees)?;
         for wt in &r.worktrees {
             for t in [&wt.index_tree].into_iter().flatten() {
@@ -905,7 +895,10 @@ fn recovery_ref(repo: &Repository, source: &str, name: &str, oid: &str) -> Strin
 }
 fn sensitive_re(repo: &Path) -> Regex {
     let _ = repo;
-    Regex::new(r#"(?i)(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|\b(password|secret|api[_-]?key|access[_-]?token|token|client[_-]?secret)\s*[:=]\s*['\"]?[A-Za-z0-9/+_=-]{8,})"#).unwrap()
+    // Gitleaks handles generic key/value assignments. This second pass checks
+    // high-confidence credential formats only; generic names like `let secret`
+    // in source code are common and otherwise block clean history.
+    Regex::new(r#"(?i)(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b)"#).unwrap()
 }
 fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
     // Run the maintained scanner against the exact commit ancestry before any
@@ -2581,6 +2574,12 @@ mod tests {
     fn secret_scan_accepts_safe_commit() {
         let d = repo();
         let oid = commit(d.path(), b"ordinary source\n");
+        scan_commit(d.path(), &oid, "").unwrap();
+    }
+    #[test]
+    fn secret_scan_accepts_generic_source_variable() {
+        let d = repo();
+        let oid = commit(d.path(), b"let secret = \"abcdefghijklmnopqr\";\n");
         scan_commit(d.path(), &oid, "").unwrap();
     }
     #[test]
