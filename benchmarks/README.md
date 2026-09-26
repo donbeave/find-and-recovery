@@ -4,16 +4,17 @@
 default preview mode. It never passes `--execute`; no remote refs are changed.
 No network remotes are used. The script puts its repositories, isolated Git
 configuration, manifest, and logs beneath one fresh temporary directory and
-removes only that directory on exit.
+removes only that directory on exit. It prints the complete preview and
+metrics to stdout; pipe it through `tee` to retain the run output.
 
 Build and run:
 
 ```sh
 cargo build --release
-benchmarks/dedupe.sh --branches 500 --mode aliases
-benchmarks/dedupe.sh --branches 500 --mode linear-same-tree
-benchmarks/dedupe.sh --branches 500 --mode divergent-same-tree --history-depth 8
-benchmarks/dedupe.sh --branches 500 --mode distinct-trees --blob-mb 64
+benchmarks/dedupe.sh --branches 500 --mode aliases | tee aliases.txt
+benchmarks/dedupe.sh --branches 500 --mode linear-same-tree | tee linear.txt
+benchmarks/dedupe.sh --branches 500 --mode divergent-same-tree --history-depth 8 | tee divergent.txt
+benchmarks/dedupe.sh --branches 500 --mode distinct-trees --blob-mb 64 | tee distinct.txt
 ```
 
 Options: `--binary PATH` selects the executable (defaults to
@@ -73,5 +74,31 @@ comparing changes: aliases isolates same-tip grouping,
 `linear-same-tree` measures ancestor containment, `divergent-same-tree` guards
 against treating equal trees as proof, and `distinct-trees` measures the
 no-containment path. Record the CLI version, Git version, host, fixture mode,
-and output with every result. The current report does not measure filesystem
-discovery, LFS transfer, network transfer bytes, cleanup, or end-to-end restore.
+and output with every result. Each invocation is one pass; it does not flush OS
+caches or distinguish cold and warm runs. The CLI does not expose per-stage
+timings, so the report measures the full preview command only. It does not
+measure filesystem discovery, LFS transfer, network transfer bytes, cleanup,
+or end-to-end restore.
+
+## Recorded release sample
+
+Measured 2026-09-26 with `rtk cargo build --release` (0 errors, 11 warnings)
+on macOS 27.0 build 26A428, Apple M5 Max, 128 GiB RAM; Rust 1.98.1 and Git
+2.55.0. Each row is one release CLI preview against a newly generated local
+bare remote; each has 500 benchmark refs plus `main`. Remote object size is
+fixture storage, not bytes transferred. Candidate counts come from the
+preview output.
+
+| Mode | History | Commits | Candidates | Git children | Wall (s) | User (s) | Sys (s) | Peak RSS (bytes) | Remote objects (KiB) | CLI output (bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `aliases` | 1 shared commit | 1 | 500 | 9 | 0.32 | 0.05 | 0.25 | 10,567,680 | 12 | 82,720 |
+| `linear-same-tree` | 500 commits in one chain | 501 | 499 | 10 | 0.46 | 0.09 | 0.34 | 10,698,752 | 1,864 | 117,573 |
+| `divergent-same-tree` | 500 chains, depth 4 | 2,001 | 0 | 10 | 0.51 | 0.09 | 0.42 | 11,567,104 | 1,392 | 44,220 |
+| `distinct-trees` | 500 distinct tips | 501 | 0 | 10 | 0.37 | 0.07 | 0.29 | 10,846,208 | 601 | 44,220 |
+
+These are single samples. The fixture creation warms filesystem pages before
+the preview; no cache flush or controlled cold/warm pair was measured. No
+before/after speedup is claimed: the earlier baseline attempt stopped at the
+unset bare-remote default branch and produced no valid metrics. The reported
+wall/RSS/child counts cover the complete dedupe preview command only; there is
+no per-stage timing, and the local remote gives no network-transfer byte count.
