@@ -13,14 +13,10 @@ use std::{
 /// Parse a GitHub.com clone URL into its `owner/repository` API path.
 pub fn repository_nwo(remote_url: &str) -> Result<String, String> {
     let value = remote_url.trim();
-    let path = if let Some((user_host, path)) = value.split_once(':') {
-        if user_host.eq_ignore_ascii_case("git@github.com") {
-            path
-        } else {
-            parse_github_url(value)?
-        }
-    } else {
+    let path = if value.contains("://") {
         parse_github_url(value)?
+    } else {
+        parse_scp_ssh_url(value)?
     };
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
@@ -38,11 +34,23 @@ pub fn repository_nwo(remote_url: &str) -> Result<String, String> {
     Ok(format!("{}/{}", pieces[0], pieces[1]))
 }
 
+fn parse_scp_ssh_url(value: &str) -> Result<&str, String> {
+    let (user, host_path) = value
+        .split_once('@')
+        .ok_or_else(|| "atomic create-ref API is supported only for github.com".to_owned())?;
+    let (host, path) = host_path
+        .split_once(':')
+        .ok_or_else(|| "GitHub SCP URL must use git@github.com:owner/repository".to_owned())?;
+    if user != "git" || !host.eq_ignore_ascii_case("github.com") {
+        return Err("atomic create-ref API is supported only for github.com".into());
+    }
+    Ok(path)
+}
+
 fn parse_github_url(value: &str) -> Result<&str, String> {
     let (scheme, rest) = value
         .split_once("://")
         .ok_or_else(|| "atomic create-ref API is supported only for github.com".to_owned())?;
-    let scheme = scheme.to_ascii_lowercase();
     let (authority, path) = rest
         .split_once('/')
         .ok_or_else(|| "GitHub clone URL is missing owner/repository".to_owned())?;
@@ -53,18 +61,23 @@ fn parse_github_url(value: &str) -> Result<&str, String> {
     if user.is_some_and(|user| user != "git") {
         return Err("GitHub SSH URL must use the git user".into());
     }
-    let (host, port) = match host_port.rsplit_once(':') {
+    let (host, port) = match host_port.split_once(':') {
         Some((host, port))
-            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+            if !host.is_empty()
+                && !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit()) =>
         {
             (host, Some(port))
         }
-        _ => (host_port, None),
+        Some(_) => return Err("GitHub clone URL has an invalid port".into()),
+        None => (host_port, None),
     };
-    let allowed = match scheme.as_str() {
-        "https" => user.is_none() && (port.is_none() || port == Some("443")),
-        "ssh" => user == Some("git") && (port.is_none() || port == Some("22")),
-        _ => false,
+    let allowed = if scheme.eq_ignore_ascii_case("https") {
+        user.is_none() && (port.is_none() || port == Some("443"))
+    } else if scheme.eq_ignore_ascii_case("ssh") {
+        user == Some("git") && (port.is_none() || port == Some("22"))
+    } else {
+        false
     };
     if !allowed || !host.eq_ignore_ascii_case("github.com") {
         return Err("atomic create-ref API is supported only for github.com".into());
@@ -317,9 +330,12 @@ mod tests {
         for url in [
             "https://github.com/ChainArgos/java-monorepo.git",
             "https://GITHUB.com:443/ChainArgos/java-monorepo.git",
+            "HTTPS://github.com:443/ChainArgos/java-monorepo.git",
             "git@github.com:ChainArgos/java-monorepo.git",
+            "git@GITHUB.com:ChainArgos/java-monorepo.git",
             "ssh://git@github.com/ChainArgos/java-monorepo.git",
             "ssh://git@GITHUB.com:22/ChainArgos/java-monorepo.git",
+            "SSH://git@github.com:22/ChainArgos/java-monorepo.git",
         ] {
             assert_eq!(repository_nwo(url).unwrap(), "ChainArgos/java-monorepo");
         }
@@ -327,7 +343,15 @@ mod tests {
             "https://github.example/owner/repo.git",
             "https://github.com/owner/repo/extra",
             "https://github.com/owner/repo?redirect=elsewhere",
+            "https://github.com:/owner/repo.git",
+            "https://github.com:443x/owner/repo.git",
             "https://github.com:444/owner/repo.git",
+            "https://github.com.evil/owner/repo.git",
+            "git@gitlab.com:owner/repo.git",
+            "git@github.com:owner/repo:unsafe.git",
+            "ssh://git@github.com:/owner/repo.git",
+            "ssh://git@github.com:22x/owner/repo.git",
+            "ssh://git@github.com:23/owner/repo.git",
             "ssh://git@github.com:2222/owner/repo.git",
             "ssh://alice@github.com/owner/repo.git",
         ] {
