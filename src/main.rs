@@ -1616,9 +1616,6 @@ fn push_ref(remote: &str, repo: &Path, oid: &str, reference: &str) -> Result<boo
         "-C".into(),
         repo.to_string_lossy().into_owned(),
         "push".into(),
-        // The preflight is informative only. An empty lease makes the actual
-        // update create-only, so a concurrent creator cannot be overwritten.
-        format!("--force-with-lease={reference}:"),
         "--porcelain".into(),
         remote.into(),
         format!("{oid}:{reference}"),
@@ -1637,6 +1634,20 @@ fn push_ref(remote: &str, repo: &Path, oid: &str, reference: &str) -> Result<boo
     }
     Ok(created)
 }
+
+fn record_preservation_failure(
+    repository: &mut Repository,
+    failure: &mut Option<String>,
+    context: String,
+    error: String,
+) {
+    let row = format!("{context}: {error}");
+    if failure.is_none() {
+        *failure = Some(row.clone());
+    }
+    repository.preservation_errors.push(row);
+}
+
 fn preserve(m: &mut Manifest) -> Result<(), String> {
     for r in &mut m.repositories {
         if r.deletion == "deleted" && !Path::new(&r.path).exists() {
@@ -1773,7 +1784,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 &branch.commit,
                 "branch",
             ) {
-                failure.get_or_insert(error);
+                record_preservation_failure(
+                    r,
+                    &mut failure,
+                    format!("save branch {} {}", branch.name, branch.commit),
+                    error,
+                );
                 continue;
             }
             mapped.insert(branch.commit);
@@ -1799,7 +1815,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     oid,
                     "recovery-local",
                 ) {
-                    failure.get_or_insert(error);
+                    record_preservation_failure(
+                        r,
+                        &mut failure,
+                        format!("save recovery-local {name} {oid}"),
+                        error,
+                    );
                     continue;
                 }
                 mapped.insert(oid.to_owned());
@@ -1824,7 +1845,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(error) => {
-                        failure.get_or_insert(error);
+                        record_preservation_failure(
+                            r,
+                            &mut failure,
+                            format!("check remote-tracking {name} {oid}"),
+                            error,
+                        );
                         continue;
                     }
                 }
@@ -1837,7 +1863,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     oid,
                     "remote-tracking",
                 ) {
-                    failure.get_or_insert(error);
+                    record_preservation_failure(
+                        r,
+                        &mut failure,
+                        format!("save remote-tracking {name} {oid}"),
+                        error,
+                    );
                     continue;
                 }
                 mapped.insert(oid.to_owned());
@@ -1846,7 +1877,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         {
             for (index, stash) in stashes.iter().enumerate() {
                 let Some(oid) = stash.split_whitespace().next() else {
-                    failure.get_or_insert("malformed stash inventory".into());
+                    record_preservation_failure(
+                        r,
+                        &mut failure,
+                        format!("save stash index {index}"),
+                        "malformed stash inventory".into(),
+                    );
                     continue;
                 };
                 if let Err(error) = save_object(
@@ -1858,7 +1894,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     oid,
                     "stash",
                 ) {
-                    failure.get_or_insert(error);
+                    record_preservation_failure(
+                        r,
+                        &mut failure,
+                        format!("save stash index {index} {oid}"),
+                        error,
+                    );
                     continue;
                 }
             }
@@ -1874,7 +1915,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     &oid,
                     "unreachable",
                 ) {
-                    failure.get_or_insert(error);
+                    record_preservation_failure(
+                        r,
+                        &mut failure,
+                        format!("save unreachable {oid}"),
+                        error,
+                    );
                     continue;
                 }
                 mapped.insert(oid);
@@ -1914,7 +1960,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                             head,
                             "detached",
                         ) {
-                            failure.get_or_insert(error);
+                            record_preservation_failure(
+                                r,
+                                &mut failure,
+                                format!("save detached worktree {} {head}", worktree.path),
+                                error,
+                            );
                             continue;
                         }
                         mapped.insert(head.to_owned());
@@ -1922,7 +1973,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 }
                 if !worktree.missing {
                     if let Err(error) = save_worktree(&remote, &common, r, &worktree) {
-                        failure.get_or_insert(error);
+                        record_preservation_failure(
+                            r,
+                            &mut failure,
+                            format!("save worktree snapshot {}", worktree.path),
+                            error,
+                        );
                         continue;
                     }
                 }
@@ -1973,14 +2029,24 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                                 saved.verification = "push-succeeded".into();
                             }
                             Err(error) => {
-                                failure.get_or_insert(error);
+                                record_preservation_failure(
+                                    r,
+                                    &mut failure,
+                                    format!("push saved {} {}", saved.remote_ref, saved.commit),
+                                    error,
+                                );
                             }
                         }
                     }
                 }
                 Err(error) => {
                     r.lfs_preservation = "blocked".into();
-                    failure.get_or_insert(error);
+                    record_preservation_failure(
+                        r,
+                        &mut failure,
+                        "preserve LFS payloads".into(),
+                        error,
+                    );
                 }
             }
             if let Some(error) = failure {
@@ -2016,6 +2082,7 @@ fn preserve_branches_only(m: &mut Manifest) -> Result<(), String> {
         let prior_saved = r.saved.clone();
         r.preservation = "blocked".into();
         r.verification_error = None;
+        r.preservation_errors.clear();
         if temporary_recovery_fixture(Path::new(&r.path)) {
             r.verification_error =
                 Some("ambiguous temporary recovery fixture; retained without upload".into());
@@ -2107,7 +2174,9 @@ fn preserve_branches_only(m: &mut Manifest) -> Result<(), String> {
         let mut scan_failures = Vec::new();
         for oid in &branch_oids {
             if let Err(error) = scan_commit(&path, oid, &m.remote) {
-                scan_failures.push(format!("scan branch tip {oid}: {error}"));
+                let row = format!("scan branch tip {oid}: {error}");
+                scan_failures.push(row.clone());
+                r.preservation_errors.push(row);
             }
         }
         r.saved.clear();
