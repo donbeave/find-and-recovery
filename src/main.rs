@@ -116,6 +116,13 @@ struct Saved {
     tree: Option<String>,
     verification: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct ExistingRef {
+    reference: String,
+    object: String,
+    object_type: String,
+    verification: String,
+}
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct Repository {
     path: String,
@@ -141,6 +148,10 @@ struct Repository {
     inventory_complete: bool,
     inventory_errors: Vec<String>,
     saved: Vec<Saved>,
+    /// Local refs outside the normal branch/stash inventory that already
+    /// exist remotely at the exact same object ID and were isolated-verified.
+    #[serde(default)]
+    existing_refs: Vec<ExistingRef>,
     /// Per-object/per-snapshot failures retained for machine-readable review.
     #[serde(default)]
     preservation_errors: Vec<String>,
@@ -155,6 +166,8 @@ struct DeletionRecord {
     common_dir: String,
     local_branches: Vec<Branch>,
     snapshots: Vec<Saved>,
+    #[serde(default)]
+    existing_refs: Vec<ExistingRef>,
     removed_paths: Vec<String>,
     completed_unix: u64,
     #[serde(default)]
@@ -196,6 +209,7 @@ fn record_deleted_copy(manifest: &mut Manifest, repository: &Repository, removed
         common_dir: repository.common_dir.clone(),
         local_branches: repository.branches.clone(),
         snapshots: repository.saved.clone(),
+        existing_refs: repository.existing_refs.clone(),
         removed_paths: removed_paths.to_vec(),
         completed_unix: now(),
         recorded_unix: now(),
@@ -208,6 +222,7 @@ fn record_deleted_copy(manifest: &mut Manifest, repository: &Repository, removed
         previous.local_path == record.local_path
             && previous.common_dir == record.common_dir
             && previous.snapshots == record.snapshots
+            && previous.existing_refs == record.existing_refs
             && previous.removed_paths == record.removed_paths
     }) {
         manifest.deletion_history.push(record);
@@ -262,7 +277,9 @@ fn merge_deletion_history(target: &mut Manifest, previous: &Manifest) {
     for repository in &previous.repositories {
         if !repository.deletion.starts_with("deleted")
             || target.deletion_history.iter().any(|record| {
-                record.local_path == repository.path && record.snapshots == repository.saved
+                record.local_path == repository.path
+                    && record.snapshots == repository.saved
+                    && record.existing_refs == repository.existing_refs
             })
         {
             continue;
@@ -284,6 +301,7 @@ fn merge_deletion_history(target: &mut Manifest, previous: &Manifest) {
             common_dir: repository.common_dir.clone(),
             local_branches: repository.branches.clone(),
             snapshots: repository.saved.clone(),
+            existing_refs: repository.existing_refs.clone(),
             removed_paths: if removed_paths.is_empty() {
                 vec![repository.path.clone()]
             } else {
@@ -458,6 +476,7 @@ fn record_recovered_deletion(
         common_dir: String::new(),
         local_branches,
         snapshots,
+        existing_refs: Vec::new(),
         removed_paths: vec![path_string.clone()],
         completed_unix: 0,
         recorded_unix: now(),
@@ -2265,6 +2284,7 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         r.preservation = "blocked".into();
         r.saved.clear();
         r.preservation_errors.clear();
+        r.existing_refs.clear();
         r.lfs_objects.clear();
         r.lfs_preservation = "pending".into();
         r.verification_error = None;
@@ -2281,19 +2301,31 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             r.verification_error = Some("incomplete Git inventory".into());
             continue;
         }
-        let unsupported = r.refs.iter().find_map(|entry| {
-            let (name, tail) = entry.split_once(' ')?;
-            let supported = name.starts_with("refs/heads/")
-                || name.starts_with("refs/remotes/")
-                || name == "refs/stash"
-                || (name.starts_with("refs/recovery-local/")
-                    && tail.split_whitespace().nth(1) == Some("commit"));
-            (!supported).then_some(name)
-        });
-        let mut blocker = unsupported
-            .map(|reference| format!("unsupported local ref blocks cleanup: {reference}"));
         let path = PathBuf::from(&r.path);
         let remote = m.remote.clone();
+        let mut blocker = None;
+        for (reference, object, object_type) in unsupported_local_refs(r) {
+            match remote_oid(&remote, &reference) {
+                Ok(Some(remote_object)) if remote_object == object => {
+                    r.existing_refs.push(ExistingRef {
+                        reference,
+                        object,
+                        object_type,
+                        verification: "pending-isolated-verification".into(),
+                    });
+                }
+                Ok(_) => {
+                    blocker.get_or_insert_with(|| {
+                        format!("unsupported local ref is missing or differs remotely: {reference}")
+                    });
+                }
+                Err(error) => {
+                    blocker.get_or_insert_with(|| {
+                        format!("cannot check unsupported local ref {reference}: {error}")
+                    });
+                }
+            }
+        }
         match branch_upstreams_target_remote(&path, &remote) {
             Ok(true) => {}
             Ok(false) => {
@@ -2707,6 +2739,7 @@ fn preserve_branches_only(m: &mut Manifest) -> Result<(), String> {
             continue;
         }
         let prior_saved = r.saved.clone();
+        r.existing_refs.clear();
         r.preservation = "blocked".into();
         r.verification_error = None;
         r.preservation_errors.clear();
@@ -3281,6 +3314,132 @@ fn isolated_verify_saved(remote: &str, saved: &Saved) -> Result<(), String> {
     Ok(())
 }
 
+fn isolated_verify_existing_ref(remote: &str, existing: &ExistingRef) -> Result<(), String> {
+    if !existing.reference.starts_with("refs/")
+        || existing.reference.contains("..")
+        || existing.reference.contains(' ')
+        || !matches!(existing.object.len(), 40 | 64)
+        || !existing.object.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || git(Path::new("."), &["check-ref-format", &existing.reference]).is_err()
+    {
+        return Err(format!("unsafe existing local ref: {}", existing.reference));
+    }
+    if remote_oid(remote, &existing.reference)?.as_deref() != Some(existing.object.as_str()) {
+        return Err(format!(
+            "existing remote ref missing or moved: {}",
+            existing.reference
+        ));
+    }
+
+    // A fresh bare object store fetches the exact ref; no source clone object
+    // directory or alternate can satisfy this check.
+    let isolated = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let repo = isolated.path().join("remote-only.git");
+    let repo_s = repo.to_str().ok_or("non-UTF8 temp path")?;
+    out(
+        &[
+            "git".into(),
+            "init".into(),
+            "--bare".into(),
+            "--quiet".into(),
+            repo_s.into(),
+        ],
+        None,
+        &[],
+    )?;
+    out(
+        &[
+            "git".into(),
+            "-C".into(),
+            repo_s.into(),
+            "remote".into(),
+            "add".into(),
+            "origin".into(),
+            remote.into(),
+        ],
+        None,
+        &[],
+    )?;
+    let suffix = format!("{:x}", Sha256::digest(existing.reference.as_bytes()));
+    let isolated_ref = format!("refs/verify-existing/{suffix}");
+    out(
+        &[
+            "git".into(),
+            "-C".into(),
+            repo_s.into(),
+            "fetch".into(),
+            "--no-tags".into(),
+            "--no-recurse-submodules".into(),
+            "origin".into(),
+            format!("{}:{isolated_ref}", existing.reference),
+        ],
+        None,
+        &[("GIT_NO_LAZY_FETCH", "1")],
+    )?;
+    let fetched = out(
+        &[
+            "git".into(),
+            "--git-dir".into(),
+            repo_s.into(),
+            "rev-parse".into(),
+            "--verify".into(),
+            isolated_ref.clone(),
+        ],
+        None,
+        &[],
+    )?;
+    if fetched.trim() != existing.object {
+        return Err(format!(
+            "isolated fetch got unexpected object for {}",
+            existing.reference
+        ));
+    }
+    if repo.join("objects/info/alternates").exists() {
+        return Err("isolated verification unexpectedly has object alternates".into());
+    }
+    let object_type = out(
+        &[
+            "git".into(),
+            "--git-dir".into(),
+            repo_s.into(),
+            "cat-file".into(),
+            "-t".into(),
+            existing.object.clone(),
+        ],
+        None,
+        &[("GIT_NO_LAZY_FETCH", "1")],
+    )?;
+    if object_type.trim() != existing.object_type {
+        return Err(format!(
+            "isolated object type differs for {}",
+            existing.reference
+        ));
+    }
+    // Full fsck checks object hashes and all objects reachable from the
+    // fetched tag/ref, including the commit tree and file blobs.
+    out(
+        &[
+            "git".into(),
+            "--git-dir".into(),
+            repo_s.into(),
+            "fsck".into(),
+            "--full".into(),
+            "--strict".into(),
+            "--no-reflogs".into(),
+            existing.object.clone(),
+        ],
+        None,
+        &[("GIT_NO_LAZY_FETCH", "1")],
+    )?;
+    if remote_oid(remote, &existing.reference)?.as_deref() != Some(existing.object.as_str()) {
+        return Err(format!(
+            "remote ref moved during verification: {}",
+            existing.reference
+        ));
+    }
+    Ok(())
+}
+
 fn isolated_verify_saved_lfs(remote: &str, repository: &Repository) -> Result<(), String> {
     let refs = repository
         .saved
@@ -3307,12 +3466,21 @@ fn verify_repository(r: &mut Repository, remote: &str) {
             return;
         }
     }
+    for existing in &r.existing_refs {
+        if let Err(error) = isolated_verify_existing_ref(remote, existing) {
+            r.verification_error = Some(error);
+            return;
+        }
+    }
     if let Err(error) = isolated_verify_saved_lfs(remote, r) {
         r.verification_error = Some(error);
         return;
     }
     for saved in &mut r.saved {
         saved.verification = "isolated-verified".into();
+    }
+    for existing in &mut r.existing_refs {
+        existing.verification = "isolated-verified".into();
     }
     r.verification = "isolated-verified".into();
 }
@@ -3503,6 +3671,14 @@ fn unsupported_local_ref(r: &Repository) -> Option<String> {
         if reference.starts_with("refs/heads/") {
             return None;
         }
+        if r.existing_refs.iter().any(|existing| {
+            existing.reference == reference
+                && existing.object == oid
+                && existing.object_type == kind
+                && existing.verification == "isolated-verified"
+        }) {
+            return None;
+        }
         // Remote-tracking refs are cached views of the target remote. Local-only
         // tracking tips are separately inventoried and saved by preserve().
         if reference.starts_with("refs/remotes/")
@@ -3525,10 +3701,35 @@ fn unsupported_local_ref(r: &Repository) -> Option<String> {
         {
             return None;
         }
-        // Tags, notes, replace refs, and unknown namespaces need their own
-        // preservation format; never drop them with the local repository.
+        // Tags, notes, replace refs, and unknown namespaces are preserved only
+        // when their exact ref/object mapping was fetched and verified remotely.
         Some(reference.to_owned())
     })
+}
+
+fn unsupported_local_refs(r: &Repository) -> Vec<(String, String, String)> {
+    r.refs
+        .iter()
+        .filter_map(|entry| {
+            let mut fields = entry.split_whitespace();
+            let (Some(reference), Some(object), Some(object_type)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return None;
+            };
+            let supported = reference.starts_with("refs/heads/")
+                || reference.starts_with("refs/remotes/")
+                || reference == "refs/stash"
+                || (reference.starts_with("refs/recovery-local/") && object_type == "commit");
+            (!supported).then(|| {
+                (
+                    reference.to_owned(),
+                    object.to_owned(),
+                    object_type.to_owned(),
+                )
+            })
+        })
+        .collect()
 }
 fn preview(m: &mut Manifest, branches_only: bool) {
     let deleted = m.deleted.iter().cloned().collect::<BTreeSet<_>>();
@@ -3699,6 +3900,17 @@ fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
                 ));
             }
         }
+        for existing in &r.existing_refs {
+            if existing.verification != "isolated-verified"
+                || remote_oid(remote, &existing.reference)?.as_deref()
+                    != Some(existing.object.as_str())
+            {
+                return Err(format!(
+                    "existing remote ref missing or changed: {}",
+                    existing.reference
+                ));
+            }
+        }
         return Ok(());
     }
     if stashes != r.stashes {
@@ -3770,6 +3982,17 @@ fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
             ));
         }
     }
+    for existing in &r.existing_refs {
+        if existing.verification != "isolated-verified"
+            || remote_oid(remote, &existing.reference)?.as_deref()
+                != Some(existing.object.as_str())
+        {
+            return Err(format!(
+                "existing remote ref missing or changed: {}",
+                existing.reference
+            ));
+        }
+    }
     Ok(())
 }
 fn cleanup_repository(
@@ -3783,6 +4006,15 @@ fn cleanup_repository(
     }
     for saved in &r.saved {
         isolated_verify_saved(remote, saved)?;
+    }
+    for existing in &r.existing_refs {
+        if existing.verification != "isolated-verified" {
+            return Err(format!(
+                "existing remote ref lacks isolated verification: {}",
+                existing.reference
+            ));
+        }
+        isolated_verify_existing_ref(remote, existing)?;
     }
     let owner = PathBuf::from(&r.path);
     let md = fs::symlink_metadata(&owner).map_err(|e| e.to_string())?;
@@ -5177,6 +5409,138 @@ mod preservation_tests {
     }
 
     #[test]
+    fn exact_existing_annotated_tag_is_isolated_verified_without_mutating_remote() {
+        let (_temp, local, remote, remote_url) = fixture();
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "tag",
+            "-a",
+            "local-only",
+            "-m",
+            "frozen tag",
+            "HEAD",
+        ]);
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "push",
+            "origin",
+            "refs/tags/local-only:refs/tags/local-only",
+        ]);
+        let tag_ref = "refs/tags/local-only";
+        let tag_oid = cmd(&["git", "-C", local.to_str().unwrap(), "rev-parse", tag_ref]);
+        let remote_before = remote_oid(&remote_url, tag_ref).unwrap();
+        assert_eq!(remote_before.as_deref(), Some(tag_oid.as_str()));
+
+        let mut manifest = manifest(&local, &remote_url);
+        preserve(&mut manifest).unwrap();
+        let repository = &mut manifest.repositories[0];
+        assert_ne!(
+            repository.preservation, "blocked",
+            "{:?}",
+            repository.verification_error
+        );
+        assert_eq!(repository.existing_refs.len(), 1);
+        assert_eq!(repository.existing_refs[0].reference, tag_ref);
+        assert_eq!(repository.existing_refs[0].object, tag_oid);
+        assert_eq!(repository.existing_refs[0].object_type, "tag");
+        assert_eq!(
+            repository.existing_refs[0].verification,
+            "pending-isolated-verification"
+        );
+
+        verify_repository(repository, &remote_url);
+        assert_eq!(
+            repository.verification, "isolated-verified",
+            "{:?}",
+            repository.verification_error
+        );
+        assert_eq!(
+            repository.existing_refs[0].verification,
+            "isolated-verified"
+        );
+        assert_eq!(cleanup_blocker(repository, false), None);
+        assert_eq!(remote_oid(&remote_url, tag_ref).unwrap(), remote_before);
+        assert_eq!(
+            cmd(&[
+                "git",
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "cat-file",
+                "-t",
+                &tag_oid,
+            ]),
+            "tag"
+        );
+    }
+
+    #[test]
+    fn existing_tag_with_different_remote_object_still_blocks_cleanup() {
+        let (_temp, local, _remote, remote_url) = fixture();
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "tag",
+            "-a",
+            "local-only",
+            "-m",
+            "remote tag object",
+            "HEAD",
+        ]);
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "push",
+            "origin",
+            "refs/tags/local-only:refs/tags/local-only",
+        ]);
+        let remote_tag_oid = remote_oid(&remote_url, "refs/tags/local-only")
+            .unwrap()
+            .unwrap();
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "tag",
+            "-f",
+            "-a",
+            "local-only",
+            "-m",
+            "different local tag object",
+            "HEAD",
+        ]);
+        let local_tag_oid = cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "rev-parse",
+            "refs/tags/local-only",
+        ]);
+        assert_ne!(local_tag_oid, remote_tag_oid);
+
+        let mut manifest = manifest(&local, &remote_url);
+        preserve(&mut manifest).unwrap();
+        let repository = &manifest.repositories[0];
+        assert_eq!(repository.preservation, "blocked");
+        assert!(repository
+            .verification_error
+            .as_deref()
+            .is_some_and(|error| error.contains("unsupported local ref is missing or differs remotely")));
+        assert!(repository.existing_refs.is_empty());
+        assert_eq!(
+            remote_oid(&remote_url, "refs/tags/local-only")
+                .unwrap()
+                .as_deref(),
+            Some(remote_tag_oid.as_str())
+        );
+    }
+
+    #[test]
     fn refresh_updates_changed_branches_without_losing_previous_push_records() {
         let (_temp, local, _remote, remote_url) = fixture();
         let mut m = manifest(&local, &remote_url);
@@ -5354,6 +5718,12 @@ mod tests {
             verification: "push-succeeded".into(),
             ..Default::default()
         };
+        let existing_ref = ExistingRef {
+            reference: "refs/tags/visual-baseline".into(),
+            object: "b".repeat(40),
+            object_type: "tag".into(),
+            verification: "isolated-verified".into(),
+        };
         let previous = Manifest {
             generated_unix: 123,
             deleted: vec![path.clone()],
@@ -5365,6 +5735,7 @@ mod tests {
                     commit: recovery.commit.clone(),
                 }],
                 saved: vec![recovery.clone()],
+                existing_refs: vec![existing_ref.clone()],
                 deletion: "deleted".into(),
                 ..Default::default()
             }],
@@ -5382,6 +5753,7 @@ mod tests {
         assert_eq!(record.local_branches[0].commit, recovery.commit);
         assert_eq!(record.snapshots[0].remote_ref, recovery.remote_ref);
         assert_eq!(record.snapshots[0].commit, recovery.commit);
+        assert_eq!(record.existing_refs, [existing_ref]);
         assert_eq!(record.removed_paths, ["/projects/removed-clone"]);
         assert_eq!(record.completed_unix, 123);
     }
