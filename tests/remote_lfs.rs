@@ -88,6 +88,18 @@ impl Fixture {
         fs::write(path, b"corrupted LFS bytes").unwrap();
     }
 
+    fn remove_lfs_file_at_tip(&self) {
+        git(Some(&self.work), &["rm", "--quiet", "payload.bin"]);
+        git(
+            Some(&self.work),
+            &["commit", "--quiet", "-m", "remove LFS file"],
+        );
+        git(
+            Some(&self.work),
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+    }
+
     fn remote_lfs_path(&self) -> PathBuf {
         self.lfs_store
             .join("lfs")
@@ -130,6 +142,24 @@ fn fresh_verifier_fetches_and_checks_actual_lfs_bytes() {
 }
 
 #[test]
+fn fresh_verifier_requires_exact_saved_lfs_pointer_set() {
+    let fixture = Fixture::new();
+    remote_lfs::verify_remote_lfs_refs_match(
+        p(&fixture.remote),
+        std::slice::from_ref(&fixture.reference),
+        &[fixture.expected_object()],
+    )
+    .unwrap();
+    let error = remote_lfs::verify_remote_lfs_refs_match(
+        p(&fixture.remote),
+        std::slice::from_ref(&fixture.reference),
+        &[],
+    )
+    .unwrap_err();
+    assert!(error.contains("pointer set differs"), "{error}");
+}
+
+#[test]
 fn local_payload_validation_accepts_bytes_matching_pointer() {
     let fixture = Fixture::new();
     let objects = remote_lfs::inventory_local_lfs_objects(
@@ -139,6 +169,54 @@ fn local_payload_validation_accepts_bytes_matching_pointer() {
     .unwrap();
     assert_eq!(objects, vec![fixture.expected_object()]);
     remote_lfs::validate_local_lfs_payloads(&fixture.work, &objects).unwrap();
+}
+
+#[test]
+fn local_inventory_includes_pointer_from_ancestor_removed_at_tip() {
+    let fixture = Fixture::new();
+    fixture.remove_lfs_file_at_tip();
+    let objects = remote_lfs::inventory_local_lfs_objects(
+        &fixture.work,
+        std::slice::from_ref(&fixture.reference),
+    )
+    .unwrap();
+    assert_eq!(objects, vec![fixture.expected_object()]);
+
+    let tip = git(Some(&fixture.work), &["rev-parse", "HEAD"]);
+    let saved = remote_lfs::inventory_local_lfs_commits(&fixture.work, &[tip]).unwrap();
+    assert_eq!(saved, vec![fixture.expected_object()]);
+    remote_lfs::validate_local_lfs_payloads(&fixture.work, &saved).unwrap();
+}
+
+#[test]
+fn fresh_remote_verifier_fetches_and_checks_ancestor_pointer_removed_at_tip() {
+    let fixture = Fixture::new();
+    fixture.remove_lfs_file_at_tip();
+    assert!(fixture.remote_lfs_path().is_file());
+    let objects = remote_lfs::verify_remote_lfs_refs(
+        p(&fixture.remote),
+        std::slice::from_ref(&fixture.reference),
+    )
+    .unwrap();
+    assert_eq!(objects, vec![fixture.expected_object()]);
+}
+
+#[test]
+fn fresh_remote_verifier_rejects_corrupt_ancestor_pointer_removed_at_tip() {
+    let fixture = Fixture::new();
+    fixture.remove_lfs_file_at_tip();
+    fixture.corrupt_payload();
+    let error = remote_lfs::verify_remote_lfs_refs(
+        p(&fixture.remote),
+        std::slice::from_ref(&fixture.reference),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("SHA-256 mismatch")
+            || error.contains("size mismatch")
+            || error.contains("fetch LFS payloads"),
+        "{error}"
+    );
 }
 
 #[test]

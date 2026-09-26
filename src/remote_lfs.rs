@@ -106,6 +106,25 @@ pub fn verify_remote_lfs_refs(remote: &str, refs: &[String]) -> Result<Vec<LfsOb
     Ok(objects)
 }
 
+/// Verify fresh remote LFS payloads and require the exact saved pointer set.
+pub fn verify_remote_lfs_refs_match(
+    remote: &str,
+    refs: &[String],
+    expected: &[LfsObject],
+) -> Result<(), String> {
+    let actual = verify_remote_lfs_refs(remote, refs)?;
+    let expected = expected.iter().cloned().collect::<BTreeSet<_>>();
+    let actual = actual.into_iter().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "remote LFS pointer set differs from saved inventory (expected {}, fetched {})",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Read all LFS pointers reachable from the supplied refs in a local repo.
 pub fn inventory_local_lfs_objects(repo: &Path, refs: &[String]) -> Result<Vec<LfsObject>, String> {
     let refs = normalize_refs(refs)?;
@@ -118,60 +137,14 @@ pub fn inventory_local_lfs_commits(
     repo: &Path,
     commits: &[String],
 ) -> Result<Vec<LfsObject>, String> {
-    let mut seen = BTreeSet::new();
-    let mut pointers = BTreeMap::<String, u64>::new();
     for commit in commits {
         if (commit.len() != 40 && commit.len() != 64)
             || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err("invalid saved commit ID for LFS inventory".into());
         }
-        if !seen.insert(commit) {
-            continue;
-        }
-        let mut command = git();
-        command
-            .arg("-C")
-            .arg(repo)
-            .args(["ls-tree", "-r", "-z", "--full-tree", commit]);
-        let output = git_output(command, "enumerate saved commit LFS pointers")?;
-        for entry in output
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-        {
-            let separator = entry
-                .iter()
-                .position(|byte| *byte == b'\t')
-                .ok_or("malformed saved tree entry")?;
-            let mut fields = entry[..separator].split(|byte| *byte == b' ');
-            let _mode = fields.next().ok_or("malformed saved tree mode")?;
-            let kind = fields.next().ok_or("malformed saved tree object type")?;
-            let oid = fields.next().ok_or("malformed saved tree object ID")?;
-            if kind != b"blob" {
-                continue;
-            }
-            let oid = std::str::from_utf8(oid).map_err(|_| "non-UTF8 saved blob ID")?;
-            let size = blob_size(repo, oid)?;
-            if size == 0 || size > POINTER_LIMIT {
-                continue;
-            }
-            let mut command = git();
-            command.arg("-C").arg(repo).args(["cat-file", "blob", oid]);
-            let content = git_output(command, "read saved possible LFS pointer")?;
-            if let Some(object) = parse_pointer(&content)? {
-                if pointers
-                    .insert(object.oid.clone(), object.size)
-                    .is_some_and(|old| old != object.size)
-                {
-                    return Err(format!("conflicting LFS pointer sizes for {}", object.oid));
-                }
-            }
-        }
     }
-    Ok(pointers
-        .into_iter()
-        .map(|(oid, size)| LfsObject { oid, size })
-        .collect())
+    collect_pointer_objects_from_roots(repo, commits, "enumerate saved commit LFS pointers")
 }
 
 /// Check that every requested local object exists and matches its pointer
@@ -203,14 +176,40 @@ fn normalize_refs(refs: &[String]) -> Result<Vec<String>, String> {
 }
 
 fn collect_pointer_objects(repo: &Path, refs: &[String]) -> Result<Vec<LfsObject>, String> {
+    collect_pointer_objects_from_roots(repo, refs, "enumerate LFS verifier history")
+}
+
+fn collect_pointer_objects_from_roots(
+    repo: &Path,
+    roots: &[String],
+    operation: &str,
+) -> Result<Vec<LfsObject>, String> {
+    let mut reachable = BTreeSet::new();
+    if !roots.is_empty() {
+        let mut command = git();
+        command.arg("-C").arg(repo).arg("rev-list").args(roots);
+        let output = git_output(command, operation)?;
+        let text =
+            std::str::from_utf8(&output).map_err(|_| "LFS history commit list is not UTF-8")?;
+        for line in text.lines() {
+            if (line.len() != 40 && line.len() != 64)
+                || !line.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("malformed commit ID in LFS history".into());
+            }
+            reachable.insert(line.to_owned());
+        }
+    }
+
     let mut pointers = BTreeMap::<String, u64>::new();
-    for reference in refs {
+    let mut seen_blobs = BTreeSet::new();
+    for commit in reachable {
         let mut command = git();
         command
             .arg("-C")
             .arg(repo)
-            .args(["ls-tree", "-r", "-z", "--full-tree", reference]);
-        let output = git_output(command, "enumerate LFS verifier tree")?;
+            .args(["ls-tree", "-r", "-z", "--full-tree", &commit]);
+        let output = git_output(command, "enumerate LFS history tree")?;
         for entry in output
             .split(|byte| *byte == 0)
             .filter(|entry| !entry.is_empty())
@@ -228,6 +227,9 @@ fn collect_pointer_objects(repo: &Path, refs: &[String]) -> Result<Vec<LfsObject
                 continue;
             }
             let oid = std::str::from_utf8(oid).map_err(|_| "non-UTF8 Git blob ID")?;
+            if !seen_blobs.insert(oid.to_owned()) {
+                continue;
+            }
             let size = blob_size(repo, oid)?;
             if size == 0 || size > POINTER_LIMIT {
                 continue;
