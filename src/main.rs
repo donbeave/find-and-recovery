@@ -1671,17 +1671,34 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
 
 fn refresh_repository(m: &mut Manifest, requested_path: &Path) -> Result<(), String> {
     let requested_common = common_dir(requested_path)?.to_string_lossy().into_owned();
-    let index = m.repositories.iter().position(|repo| repo.common_dir == requested_common)
-        .ok_or_else(|| format!("repository not present in manifest: {}", requested_path.display()))?;
+    let index = m
+        .repositories
+        .iter()
+        .position(|repo| repo.common_dir == requested_common)
+        .ok_or_else(|| {
+            format!(
+                "repository not present in manifest: {}",
+                requested_path.display()
+            )
+        })?;
     let previous = m.repositories[index].clone();
-    let owner = if Path::new(&requested_common).file_name().is_some_and(|name| name == ".git") {
-        Path::new(&requested_common).parent().ok_or("invalid common Git directory")?.to_path_buf()
+    let owner = if Path::new(&requested_common)
+        .file_name()
+        .is_some_and(|name| name == ".git")
+    {
+        Path::new(&requested_common)
+            .parent()
+            .ok_or("invalid common Git directory")?
+            .to_path_buf()
     } else {
         requested_path.to_path_buf()
     };
     let mut refreshed = inventory_one(&owner, previous.matched_paths.clone(), &m.remote);
     if !refreshed.inventory_complete {
-        return Err(format!("refreshed inventory incomplete: {}", refreshed.inventory_errors.join("; ")));
+        return Err(format!(
+            "refreshed inventory incomplete: {}",
+            refreshed.inventory_errors.join("; ")
+        ));
     }
     refreshed.saved = previous.saved;
     m.repositories[index] = refreshed;
@@ -2430,6 +2447,11 @@ fn main() -> Result<(), String> {
             save(&m, &state)?;
             println!("preservation recorded; inspect manifest")
         }
+        Phase::Refresh { path } => {
+            refresh_repository(&mut m, &path)?;
+            save(&m, &state)?;
+            println!("refreshed\t{}", path.display());
+        }
         Phase::Preview => {
             preview(&mut m);
             save(&m, &state)?;
@@ -2955,6 +2977,59 @@ mod preservation_tests {
                 "refs/tags",
             ]),
             ""
+        );
+    }
+
+    #[test]
+    fn refresh_updates_changed_branches_without_losing_previous_push_records() {
+        let (_temp, local, _remote, remote_url) = fixture();
+        let mut m = manifest(&local, &remote_url);
+        preserve(&mut m).unwrap();
+        let old_ref = m.repositories[0]
+            .saved
+            .iter()
+            .find(|saved| saved.source == "branch")
+            .unwrap()
+            .remote_ref
+            .clone();
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "switch",
+            "-c",
+            "later",
+        ]);
+        fs::write(local.join("later.txt"), "new branch\n").unwrap();
+        cmd(&["git", "-C", local.to_str().unwrap(), "add", "later.txt"]);
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "commit",
+            "-m",
+            "later branch",
+        ]);
+        refresh_repository(&mut m, &local).unwrap();
+        assert!(
+            m.repositories[0]
+                .branches
+                .iter()
+                .any(|branch| branch.name == "later")
+        );
+        preserve(&mut m).unwrap();
+        assert_eq!(m.repositories[0].preservation, "complete");
+        assert!(
+            m.repositories[0]
+                .saved
+                .iter()
+                .any(|saved| saved.remote_ref == old_ref)
+        );
+        assert!(
+            m.repositories[0]
+                .saved
+                .iter()
+                .any(|saved| saved.name == "branch:later")
         );
     }
 }
