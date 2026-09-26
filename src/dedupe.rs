@@ -24,6 +24,48 @@ pub struct TreeDuplicateGroup {
     pub delete_candidates: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactDuplicateGroup {
+    pub oid: String,
+    pub branches: Vec<String>,
+    pub keeper: String,
+    pub delete_candidates: Vec<String>,
+}
+
+/// Group branches only when their exact commit IDs match. Preserve protected
+/// branches (including `main`) and retain one deterministic name per group.
+pub fn exact_duplicate_groups(
+    branches: impl IntoIterator<Item = BranchSnapshot>,
+    protected: &BTreeSet<String>,
+) -> Vec<ExactDuplicateGroup> {
+    let mut by_oid = BTreeMap::<String, BTreeSet<String>>::new();
+    for branch in branches {
+        by_oid.entry(branch.oid).or_default().insert(branch.name);
+    }
+    by_oid
+        .into_iter()
+        .filter_map(|(oid, names)| {
+            if names.len() < 2 {
+                return None;
+            }
+            let keeper = names
+                .iter()
+                .find(|name| protected.contains(*name))
+                .or_else(|| names.iter().next())?
+                .clone();
+            Some(ExactDuplicateGroup {
+                oid,
+                branches: names.iter().cloned().collect(),
+                keeper: keeper.clone(),
+                delete_candidates: names
+                    .into_iter()
+                    .filter(|name| name != &keeper && !protected.contains(name))
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 /// Group remote branches by committed tree and select one branch to retain.
 ///
 /// Exact `main` and one representative for every incomparable maximal history
@@ -71,10 +113,16 @@ pub fn tree_duplicate_groups(
                 let representative = names_and_counts
                     .values()
                     .filter(|branch| branch.oid == oid)
-                    .max_by(|left, right| {
-                        left.commit_count
-                            .cmp(&right.commit_count)
-                            .then_with(|| right.name.cmp(&left.name))
+                    .find(|branch| branch.name == "main")
+                    .or_else(|| {
+                        names_and_counts
+                            .values()
+                            .filter(|branch| branch.oid == oid)
+                            .max_by(|left, right| {
+                                left.commit_count
+                                    .cmp(&right.commit_count)
+                                    .then_with(|| right.name.cmp(&left.name))
+                            })
                     })?;
                 retained.insert(representative.name.clone());
             }
@@ -134,6 +182,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_duplicates_only_and_protected_name_wins() {
+        let protected = BTreeSet::from(["main".to_owned(), "stable".to_owned()]);
+        let groups = exact_duplicate_groups(
+            [
+                snapshot("alias", "same-oid", "tree", 3),
+                snapshot("main", "same-oid", "tree", 3),
+                snapshot("stable", "same-oid", "tree", 3),
+                snapshot("same-tree-different-tip", "other-oid", "tree", 4),
+            ],
+            &protected,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].keeper, "main");
+        assert_eq!(groups[0].delete_candidates, ["alias"]);
+    }
+
     fn contained_snapshot(
         name: &str,
         oid: &str,
@@ -183,9 +248,11 @@ mod tests {
             snapshot("recovery/long", "long-tip", "same-tree", 40),
         ]);
         assert_eq!(groups[0].keep_branch, "main");
-        assert!(groups[0]
-            .retained_branches
-            .contains(&"recovery/long".to_owned()));
+        assert!(
+            groups[0]
+                .retained_branches
+                .contains(&"recovery/long".to_owned())
+        );
         assert!(groups[0].delete_candidates.is_empty());
     }
 
@@ -211,11 +278,13 @@ mod tests {
 
     #[test]
     fn different_trees_are_not_duplicates() {
-        assert!(tree_duplicate_groups([
-            snapshot("one", "c1", "tree-one", 2),
-            snapshot("two", "c2", "tree-two", 3),
-        ])
-        .is_empty());
+        assert!(
+            tree_duplicate_groups([
+                snapshot("one", "c1", "tree-one", 2),
+                snapshot("two", "c2", "tree-two", 3),
+            ])
+            .is_empty()
+        );
     }
 
     #[test]
@@ -243,10 +312,68 @@ mod tests {
     #[test]
     fn exact_commit_alias_can_be_deleted() {
         let groups = tree_duplicate_groups([
+            snapshot("aaa-alias", "same-oid", "same-tree", 8),
             snapshot("main", "same-oid", "same-tree", 8),
             snapshot("topic", "same-oid", "same-tree", 8),
         ]);
         assert_eq!(groups[0].retained_branches, ["main"]);
-        assert_eq!(groups[0].delete_candidates, ["topic"]);
+        assert_eq!(groups[0].delete_candidates, ["aaa-alias", "topic"]);
+    }
+
+    #[test]
+    fn exact_planner_ignores_same_tree_branches_with_different_oids() {
+        let groups = exact_duplicate_groups(
+            [
+                snapshot("topic/short", "short-oid", "same-tree", 2),
+                snapshot("topic/long", "long-oid", "same-tree", 3),
+            ],
+            &BTreeSet::from(["main".to_owned()]),
+        );
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn exact_planner_never_marks_main_as_candidate() {
+        let groups = exact_duplicate_groups(
+            [
+                snapshot("main", "shared-oid", "tree", 4),
+                snapshot("recovery/one", "shared-oid", "tree", 4),
+                snapshot("recovery/two", "shared-oid", "tree", 4),
+            ],
+            &BTreeSet::from(["main".to_owned()]),
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].keeper, "main");
+        assert_eq!(
+            groups[0].delete_candidates,
+            ["recovery/one", "recovery/two"]
+        );
+        assert!(
+            !groups[0]
+                .delete_candidates
+                .iter()
+                .any(|name| name == "main")
+        );
+    }
+
+    #[test]
+    fn exact_planner_keeps_default_and_master_even_when_they_are_aliases() {
+        let protected =
+            BTreeSet::from(["main".to_owned(), "master".to_owned(), "default".to_owned()]);
+        let groups = exact_duplicate_groups(
+            [
+                snapshot("main", "shared-oid", "tree", 4),
+                snapshot("master", "shared-oid", "tree", 4),
+                snapshot("default", "shared-oid", "tree", 4),
+                snapshot("recovery/find-and-recovery/alias", "shared-oid", "tree", 4),
+            ],
+            &protected,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].keeper, "default");
+        assert_eq!(
+            groups[0].delete_candidates,
+            ["recovery/find-and-recovery/alias"]
+        );
     }
 }

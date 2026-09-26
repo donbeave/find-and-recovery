@@ -1,4 +1,6 @@
+mod conditional_delete;
 mod dedupe;
+mod remote_snapshot;
 
 use clap::{Parser, Subcommand};
 use regex::bytes::Regex;
@@ -2842,204 +2844,77 @@ fn cleanup_repository(
 fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
     let remote = m.remote.clone();
     reject_remote_url_rewrite(&remote, None)?;
-    let push_context = tempfile::Builder::new()
-        .prefix("find-and-recovery-dedupe-")
-        .tempdir()
-        .map_err(|e| format!("create isolated push context: {e}"))?;
-    out(
-        &[
-            "git".into(),
-            "init".into(),
-            "--bare".into(),
-            "-q".into(),
-            push_context.path().to_string_lossy().into_owned(),
-        ],
-        None,
-        &[],
-    )?;
-    let heads = out(
-        &[
-            "git".into(),
-            "ls-remote".into(),
-            "--heads".into(),
-            remote.clone(),
-        ],
-        None,
-        &[],
-    )?;
-    // Fetch remote heads into a new bare repository without local alternates.
-    out(
-        &[
-            "git".into(),
-            "-C".into(),
-            push_context.path().to_string_lossy().into_owned(),
-            "fetch".into(),
-            "--no-tags".into(),
-            remote.clone(),
-            "+refs/heads/*:refs/remotes/dedupe/*".into(),
-        ],
-        None,
-        &[],
-    )?;
-    let heads_after_fetch = out(
-        &[
-            "git".into(),
-            "ls-remote".into(),
-            "--heads".into(),
-            remote.clone(),
-        ],
-        None,
-        &[],
-    )?;
-    if heads.lines().collect::<BTreeSet<_>>() != heads_after_fetch.lines().collect::<BTreeSet<_>>()
-    {
-        return Err("remote branches changed during duplicate scan; rerun dedupe".into());
-    }
-    let mut branch_oids = BTreeMap::new();
-    let branches = heads
-        .lines()
-        .map(|line| -> Result<dedupe::BranchSnapshot, String> {
-            let (oid, full_name) = line.split_once('\t').ok_or("malformed ls-remote row")?;
-            let name = full_name
-                .strip_prefix("refs/heads/")
-                .ok_or_else(|| format!("unexpected remote ref {full_name}"))?
-                .to_owned();
-            let fetched_oid = out(
-                &[
-                    "git".into(),
-                    "-C".into(),
-                    push_context.path().to_string_lossy().into_owned(),
-                    "rev-parse".into(),
-                    format!("refs/remotes/dedupe/{name}"),
-                ],
-                None,
-                &[],
-            )?
-            .trim()
-            .to_owned();
-            if fetched_oid != oid {
-                return Err(format!("remote branch changed during scan: {name}"));
-            }
-            branch_oids.insert(name.clone(), oid.to_owned());
-            let tree_oid = out(
-                &[
-                    "git".into(),
-                    "-C".into(),
-                    push_context.path().to_string_lossy().into_owned(),
-                    "rev-parse".into(),
-                    format!("{oid}^{{tree}}"),
-                ],
-                None,
-                &[],
-            )?
-            .trim()
-            .to_owned();
-            let commit_count = out(
-                &[
-                    "git".into(),
-                    "-C".into(),
-                    push_context.path().to_string_lossy().into_owned(),
-                    "rev-list".into(),
-                    "--count".into(),
-                    oid.into(),
-                ],
-                None,
-                &[],
-            )?
-            .trim()
-            .parse::<u64>()
-            .map_err(|error| format!("invalid commit count for {name}: {error}"))?;
-            Ok(dedupe::BranchSnapshot {
-                name,
-                oid: oid.into(),
-                tree_oid,
-                commit_count,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut protected: BTreeSet<String> = ["main".into(), "master".into()].into_iter().collect();
-    let default_head = out(
-        &[
-            "git".into(),
-            "ls-remote".into(),
-            "--symref".into(),
-            remote.clone(),
-            "HEAD".into(),
-        ],
-        None,
-        &[],
-    )?;
-    if let Some(default_branch) = default_head.lines().find_map(|line| {
-        line.strip_prefix("ref: refs/heads/")?
-            .split_once('\t')
-            .map(|v| v.0)
-    }) {
-        protected.insert(default_branch.to_owned());
-    }
-    let managed_refs = m
-        .repositories
+    let branches = remote_snapshot::fetch_remote_snapshots(&remote)?;
+    let branch_facts = branches
         .iter()
-        .flat_map(|repo| repo.saved.iter())
-        .filter(|saved| saved.created_by_this_run && saved.verification == "push-succeeded")
-        .map(|saved| saved.remote_ref.clone())
+        .map(|branch| (branch.name.clone(), branch.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let default_branch = remote_snapshot::default_branch(&remote)?
+        .ok_or_else(|| "could not determine remote default branch; refusing dedupe".to_owned())?;
+    // Only this tool's recovery namespace can be deleted. All ordinary refs,
+    // plus the common primary names, are keepers; duplicates require identical
+    // commit IDs, not merely equal trees or related histories.
+    let protected = branches
+        .iter()
+        .filter(|branch| {
+            branch.name == "main"
+                || branch.name == "master"
+                || default_branch == branch.name
+                || !branch.name.starts_with("recovery/find-and-recovery/")
+        })
+        .map(|branch| branch.name.clone())
         .collect::<BTreeSet<_>>();
-    let branches = branches
-        .into_iter()
-        .filter(|branch| managed_refs.contains(&branch.name) && !protected.contains(&branch.name))
-        .collect::<Vec<_>>();
-    let groups = dedupe::tree_duplicate_groups(branches);
+    let groups = dedupe::exact_duplicate_groups(branches, &protected);
+    let mut blocked = Vec::new();
     for group in groups {
-        let keep = group.keep_branch.clone();
         println!(
-            "tree:{}\t{}\tkeep:{}\tdelete:{}",
-            group.tree_oid,
+            "commit:{}\t{}\tkeep:{}\tdelete:{}",
+            group.oid,
             group.branches.join(","),
-            keep,
+            group.keeper,
             group.delete_candidates.join(",")
         );
         for name in group.delete_candidates {
-            let candidate_oid = branch_oids
+            let candidate = branch_facts
                 .get(&name)
-                .ok_or_else(|| format!("missing scanned tip for {name}"))?;
-            let keep_oid = branch_oids
-                .get(&keep)
-                .ok_or_else(|| format!("missing scanned tip for {keep}"))?;
+                .ok_or_else(|| format!("missing scanned snapshot for {name}"))?;
+            let keeper = branch_facts
+                .get(&group.keeper)
+                .filter(|keeper| candidate.oid == keeper.oid)
+                .ok_or_else(|| format!("no history-preserving keeper found for {name}"))?;
             if !execute {
-                println!("preview-delete\t{name}\tkeep\t{keep}");
+                println!("preview-delete\t{name}\tkeep\t{}", keeper.name);
                 continue;
             }
-            if remote_oid(&remote, &format!("refs/heads/{name}"))?.as_deref()
-                != Some(candidate_oid.as_str())
-            {
-                eprintln!("retained {name}; remote tip changed");
+            if let Err(error) = conditional_delete::delete_if_unchanged(
+                &remote,
+                &format!("refs/heads/{name}"),
+                &candidate.oid,
+                &format!("refs/heads/{}", keeper.name),
+                &keeper.oid,
+            ) {
+                eprintln!("retained {name}; conditional delete failed: {error}");
+                blocked.push(format!("{name}: {error}"));
                 continue;
             }
-            if remote_oid(&remote, &format!("refs/heads/{keep}"))?.as_deref()
-                != Some(keep_oid.as_str())
-            {
-                eprintln!("retained {name}; keep branch changed: {keep}");
-                continue;
-            }
-            // Conditional ref deletion: abort if the observed tip changed.
-            out(
-                &[
-                    "git".into(),
-                    "push".into(),
-                    "--delete".into(),
-                    remote.clone(),
-                    name.clone(),
-                ],
-                Some(push_context.path()),
-                &[],
-            )?;
-            if remote_oid(&remote, &format!("refs/heads/{name}"))?.is_some() {
-                return Err(format!("remote branch still exists after deletion: {name}"));
+            match remote_oid(&remote, &format!("refs/heads/{name}")) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    eprintln!("retained {name}; remote branch still exists after deletion");
+                    blocked.push(format!("{name}: remote branch still exists after deletion"));
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("retained {name}; cannot confirm deletion: {error}");
+                    blocked.push(format!("{name}: cannot confirm deletion: {error}"));
+                    continue;
+                }
             }
             for repo in &mut m.repositories {
                 if repo.deletion == "deleted" || repo.deletion.starts_with("blocked") {
                     for saved in &mut repo.saved {
                         if saved.remote_ref == name {
-                            saved.retained_ref = Some(keep.clone());
+                            saved.retained_ref = Some(keeper.name.clone());
                         }
                     }
                 }
@@ -3048,7 +2923,15 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
             println!("deleted\t{name}");
         }
     }
-    Ok(())
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} duplicate branch deletion(s) blocked: {}",
+            blocked.len(),
+            blocked.join("; ")
+        ))
+    }
 }
 fn main() -> Result<(), String> {
     let cli = Cli::parse();
@@ -3968,7 +3851,7 @@ mod dedupe_integration_tests {
     }
 
     #[test]
-    fn deletes_only_created_duplicate_recovery_refs_and_keeps_main() {
+    fn deletes_eligible_duplicate_branches_and_keeps_main() {
         let temp = tempfile::tempdir().unwrap();
         let remote = temp.path().join("remote.git");
         let local = temp.path().join("local");
@@ -4034,6 +3917,24 @@ mod dedupe_integration_tests {
             "push".into(),
             remote_s.clone(),
             "HEAD:refs/heads/main".into(),
+        ]);
+        for name in ["stable", "unmanaged/alias"] {
+            run(&[
+                "git".into(),
+                "-C".into(),
+                local.display().to_string(),
+                "push".into(),
+                remote_s.clone(),
+                format!("{oid}:refs/heads/{name}"),
+            ]);
+        }
+        run(&[
+            "git".into(),
+            "--git-dir".into(),
+            remote.display().to_string(),
+            "symbolic-ref".into(),
+            "HEAD".into(),
+            "refs/heads/stable".into(),
         ]);
 
         let refs = [
@@ -4133,13 +4034,27 @@ mod dedupe_integration_tests {
             Some(oid.as_str())
         );
         assert_eq!(
-            remote_oid(&remote_s, &format!("refs/heads/{}", refs[0]))
+            remote_oid(&remote_s, "refs/heads/stable")
                 .unwrap()
                 .as_deref(),
             Some(oid.as_str())
         );
         assert_eq!(
-            remote_oid(&remote_s, &format!("refs/heads/{}", refs[1])).unwrap(),
+            remote_oid(&remote_s, "refs/heads/unmanaged/alias")
+                .unwrap()
+                .as_deref(),
+            Some(oid.as_str())
+        );
+        assert_eq!(
+            remote_oid(&remote_s, &format!("refs/heads/{}", refs[0]))
+                .unwrap()
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            remote_oid(&remote_s, &format!("refs/heads/{}", refs[1]))
+                .unwrap()
+                .as_deref(),
             None
         );
         assert_eq!(

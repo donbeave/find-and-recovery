@@ -1,9 +1,6 @@
 //! Conditional deletion of a duplicate remote branch.
 //!
-//! The keeper and candidate tips are checked against the caller's scan OIDs.
-//! The push uses explicit leases for both refs and an atomic ref transaction.
-//! Git may omit an unchanged keeper from the server-side transaction; tests
-//! document the resulting limit on keeper race protection.
+//! Recheck both refs immediately before an ordinary, non-force branch delete.
 
 use std::path::Path;
 use std::process::Command;
@@ -11,15 +8,11 @@ use std::process::Command;
 /// Delete `candidate_ref` only if its tip and `keeper_ref` still match the
 /// caller's observed OIDs.
 ///
-/// Both refs must be full refs (for example, `refs/heads/topic`). A fresh
-/// temporary bare repository fetches the expected keeper tip, then submits an
-/// atomic push containing a same-tip keeper refspec and candidate deletion.
-/// `--force-with-lease` is used only as an expected-old-OID guard; no ref is
-/// force-updated. The candidate deletion is guarded by the server's expected
-/// old OID. The keeper lease guards the tip advertised during push negotiation;
-/// Git may omit a same-tip keeper refspec from the server transaction, so this
-/// does not guarantee rejection if the keeper moves after advertisement.
-/// Errors fail closed unless the remote changes concurrently.
+/// Both refs must be full refs (for example, `refs/heads/topic`). The candidate
+/// and keeper must still point at the same expected commit, and protected
+/// primary refs cannot be candidates. Git's ordinary delete push has no
+/// compare-and-delete transaction; the preflight check narrows but cannot
+/// eliminate the race with a concurrent remote update.
 pub fn delete_if_unchanged(
     remote: &str,
     candidate_ref: &str,
@@ -34,49 +27,59 @@ pub fn delete_if_unchanged(
     validate_oid(keeper_oid)?;
     validate_ref(candidate_ref)?;
     validate_ref(keeper_ref)?;
-
-    let isolated = tempfile::Builder::new()
-        .prefix("find-and-recovery-conditional-delete-")
-        .tempdir()
-        .map_err(|e| format!("create isolated push context: {e}"))?;
-    git(None, &["init", "--bare", "-q", path_arg(isolated.path())])?;
-
-    // Fetch only the keeper into an isolated object database. Its exact OID is
-    // checked before it is used as the source of the same-tip refspec.
-    let keeper_source = "refs/expected/keeper";
-    let fetch_refspec = format!("+{keeper_ref}:{keeper_source}");
-    git(
-        Some(isolated.path()),
-        &["fetch", "--no-tags", remote, &fetch_refspec],
-    )?;
-    let fetched_keeper = git(
-        Some(isolated.path()),
-        &["rev-parse", "--verify", keeper_source],
-    )?;
-    if fetched_keeper.trim() != keeper_oid {
+    if candidate_oid != keeper_oid {
+        return Err("candidate and keeper must have the same expected commit ID".into());
+    }
+    let default_ref = remote_default_ref(remote)?
+        .ok_or_else(|| "remote default branch is unknown; refusing delete".to_owned())?;
+    if matches!(candidate_ref, "refs/heads/main" | "refs/heads/master")
+        || candidate_ref.strip_prefix("refs/heads/") == Some(default_ref.as_str())
+    {
         return Err(format!(
-            "keeper tip changed before conditional delete: expected {keeper_oid}, found {}",
-            fetched_keeper.trim()
+            "refusing to delete protected branch {candidate_ref}"
         ));
     }
-
-    let candidate_lease = format!("--force-with-lease={candidate_ref}:{candidate_oid}");
-    let keeper_lease = format!("--force-with-lease={keeper_ref}:{keeper_oid}");
-    let keeper_update = format!("{keeper_source}:{keeper_ref}");
-    let candidate_delete = format!(":{candidate_ref}");
-    git(
-        Some(isolated.path()),
-        &[
-            "push",
-            "--atomic",
-            &candidate_lease,
-            &keeper_lease,
-            remote,
-            &keeper_update,
-            &candidate_delete,
-        ],
-    )?;
+    if remote_ref_oid(remote, candidate_ref)?.as_deref() != Some(candidate_oid) {
+        return Err(format!(
+            "candidate tip changed before delete: {candidate_ref}"
+        ));
+    }
+    if remote_ref_oid(remote, keeper_ref)?.as_deref() != Some(keeper_oid) {
+        return Err(format!("keeper tip changed before delete: {keeper_ref}"));
+    }
+    let branch = candidate_ref
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| format!("expected a branch ref, got: {candidate_ref}"))?;
+    git(None, &delete_push_args(remote, branch))?;
+    if remote_ref_oid(remote, candidate_ref)?.is_some() {
+        return Err(format!("branch still exists after delete: {candidate_ref}"));
+    }
+    if remote_ref_oid(remote, keeper_ref)?.as_deref() != Some(keeper_oid) {
+        return Err(format!("keeper tip changed during delete: {keeper_ref}"));
+    }
     Ok(())
+}
+
+fn delete_push_args<'a>(remote: &'a str, branch: &'a str) -> [&'a str; 4] {
+    ["push", "--delete", remote, branch]
+}
+
+fn remote_default_ref(remote: &str) -> Result<Option<String>, String> {
+    let listing = git(None, &["ls-remote", "--symref", remote, "HEAD"])?;
+    Ok(listing.lines().find_map(|line| {
+        let (target, name) = line.split_once('\t')?;
+        (name == "HEAD")
+            .then(|| target.strip_prefix("ref: refs/heads/").map(str::to_owned))
+            .flatten()
+    }))
+}
+
+fn remote_ref_oid(remote: &str, reference: &str) -> Result<Option<String>, String> {
+    let listing = git(None, &["ls-remote", "--refs", remote, reference])?;
+    Ok(listing.lines().find_map(|line| {
+        let (oid, name) = line.split_once('\t')?;
+        (name == reference).then(|| oid.to_owned())
+    }))
 }
 
 fn validate_oid(oid: &str) -> Result<(), String> {
@@ -162,8 +165,22 @@ fn safe_verb<'a>(args: &[&'a str]) -> &'a str {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+
+    #[test]
+    fn branch_deletion_uses_no_force_option() {
+        let args = delete_push_args("origin", "recovery/find-and-recovery/duplicate");
+        assert_eq!(
+            args,
+            [
+                "push",
+                "--delete",
+                "origin",
+                "recovery/find-and-recovery/duplicate"
+            ]
+        );
+        assert!(!args.iter().any(|argument| argument.contains("force")));
+    }
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -198,6 +215,22 @@ mod tests {
             run(
                 Some(&work),
                 &["push", "-q", "origin", "HEAD:refs/heads/candidate"],
+            );
+            for branch in ["main", "master", "default"] {
+                run(
+                    Some(&work),
+                    &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")],
+                );
+            }
+            run(
+                None,
+                &[
+                    "--git-dir",
+                    path_arg(&remote),
+                    "symbolic-ref",
+                    "HEAD",
+                    "refs/heads/default",
+                ],
             );
             let candidate_oid = output(Some(&work), &["rev-parse", "HEAD"]);
             let keeper_oid = candidate_oid.clone();
@@ -245,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_candidate_when_both_tips_match() {
+    fn deletes_exact_candidate_with_ordinary_push_and_preserves_keeper() {
         let fixture = Fixture::new();
         delete_if_unchanged(
             fixture.remote.to_str().unwrap(),
@@ -263,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_candidate_lease_keeps_both_remote_refs_unchanged() {
+    fn moved_candidate_is_retained() {
         let fixture = Fixture::new();
         let moved_candidate = fixture.advance_branch("candidate", "candidate moved\n");
         let result = delete_if_unchanged(
@@ -285,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_keeper_lease_keeps_candidate_and_moved_keeper_unchanged() {
+    fn moved_keeper_keeps_candidate() {
         let fixture = Fixture::new();
         let moved_keeper = fixture.advance_branch("keeper", "keeper moved\n");
         let result = delete_if_unchanged(
@@ -307,38 +340,24 @@ mod tests {
     }
 
     #[test]
-    fn keeper_move_after_advertisement_is_not_server_guarded() {
+    fn main_master_and_advertised_default_are_protected() {
         let fixture = Fixture::new();
-        let moved_keeper = fixture.advance_branch("race-target", "keeper moves in hook\n");
-        let hook = fixture.remote.join("hooks").join("pre-receive");
-        fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\nset -eu\ngit update-ref refs/heads/keeper {moved_keeper} {}\n",
-                fixture.keeper_oid
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions).unwrap();
-
-        let result = delete_if_unchanged(
-            fixture.remote.to_str().unwrap(),
-            "refs/heads/candidate",
-            &fixture.candidate_oid,
-            "refs/heads/keeper",
-            &fixture.keeper_oid,
-        );
-
-        // Git omits the unchanged keeper update from the push transaction.
-        // A receive hook can therefore move keeper while candidate deletion
-        // proceeds. This test deliberately captures the guarantee boundary.
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(fixture.remote_oid("refs/heads/candidate"), None);
-        assert_eq!(
-            fixture.remote_oid("refs/heads/keeper").as_deref(),
-            Some(moved_keeper.as_str())
-        );
+        for branch in ["main", "master", "default"] {
+            let error = delete_if_unchanged(
+                fixture.remote.to_str().unwrap(),
+                &format!("refs/heads/{branch}"),
+                &fixture.candidate_oid,
+                "refs/heads/keeper",
+                &fixture.keeper_oid,
+            )
+            .unwrap_err();
+            assert!(error.contains("protected branch"), "{branch}: {error}");
+            assert_eq!(
+                fixture
+                    .remote_oid(&format!("refs/heads/{branch}"))
+                    .as_deref(),
+                Some(fixture.candidate_oid.as_str())
+            );
+        }
     }
 }

@@ -76,55 +76,50 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
             .push((branch.to_owned(), oid.clone()));
     }
 
-    let mut counts = BTreeMap::<String, u64>::new();
-    let mut contained_oids = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut contained_oids = BTreeMap::<String, String>::new();
     for group in by_tree.values().filter(|group| group.len() > 1) {
         let group_oids = group
             .iter()
             .map(|(_, oid)| oid.clone())
             .collect::<BTreeSet<_>>();
-        for oid in &group_oids {
-            let output = git_in(
-                Some(&git_dir),
-                [
-                    OsStr::new("rev-list"),
-                    OsStr::new("--count"),
-                    OsStr::new(oid),
-                ],
-            )?;
-            let count = String::from_utf8(output.stdout)
-                .map_err(|_| format!("non-UTF-8 commit count for {oid}"))?
-                .trim()
-                .parse::<u64>()
-                .map_err(|error| format!("invalid commit count for {oid}: {error}"))?;
-            counts.insert(oid.clone(), count);
-        }
-
-        // A smaller reachable-commit count can only be contained by a larger
-        // history. Equal counts with different tips are necessarily
-        // incomparable, so skip those process calls. Equal tips are aliases.
+        // Git computes the maximal (pairwise incomparable) tips in one
+        // process. Every omitted tip is an ancestor of at least one maximal
+        // tip. Map each omitted OID to one verified maximal keeper; the
+        // planner only needs one witness to prove safe deletion.
         let unique_oids = group_oids.into_iter().collect::<Vec<_>>();
-        for left in 0..unique_oids.len() {
-            for right in (left + 1)..unique_oids.len() {
-                let first = &unique_oids[left];
-                let second = &unique_oids[right];
-                let first_count = counts[first];
-                let second_count = counts[second];
-                if first_count == second_count {
-                    continue;
-                }
-                let (ancestor, descendant) = if first_count < second_count {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                if is_ancestor(&git_dir, ancestor, descendant)? {
-                    contained_oids
-                        .entry(ancestor.clone())
-                        .or_default()
-                        .insert(descendant.clone());
+        let maximal_oids = independent_commits(&git_dir, &unique_oids)?;
+        let mut maximal_targets = maximal_oids
+            .iter()
+            .map(|oid| {
+                let representative = group
+                    .iter()
+                    .filter(|(_, branch_oid)| branch_oid == oid)
+                    .map(|(name, _)| name)
+                    .min()
+                    .cloned()
+                    .ok_or_else(|| format!("no branch name for maximal commit {oid}"))?;
+                Ok((oid.clone(), representative))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        maximal_targets.sort_by(|(_, left_name), (_, right_name)| left_name.cmp(right_name));
+
+        for oid in &unique_oids {
+            if maximal_oids.contains(oid) {
+                continue;
+            }
+            let mut keeper = None;
+            for (descendant_oid, representative) in &maximal_targets {
+                if is_ancestor(&git_dir, oid, descendant_oid)? {
+                    keeper = Some(representative.clone());
+                    break;
                 }
             }
+            let keeper = keeper.ok_or_else(|| {
+                format!(
+                    "merge-base --independent omitted {oid}, but no maximal descendant was verified"
+                )
+            })?;
+            contained_oids.insert(oid.clone(), keeper);
         }
     }
 
@@ -138,24 +133,11 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
             .get(&oid)
             .ok_or_else(|| format!("missing tree result for commit {oid}"))?
             .clone();
-        let containing_branches = by_tree
-            .get(&tree_oid)
-            .into_iter()
-            .flatten()
-            .filter(|(other_name, other_oid)| {
-                other_name != &name
-                    && (other_oid == &oid
-                        || contained_oids
-                            .get(&oid)
-                            .is_some_and(|descendants| descendants.contains(other_oid)))
-            })
-            .map(|(other_name, _)| other_name.clone())
-            .collect();
+        let containing_branches = contained_oids.get(&oid).cloned().into_iter().collect();
         snapshots.push(BranchSnapshot {
             name,
             oid: oid.clone(),
             tree_oid,
-            commit_count: counts.get(&oid).copied().unwrap_or(0),
             contained_by: containing_branches,
         });
     }
@@ -165,6 +147,41 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
         return Err("remote branch tips changed while taking snapshot".into());
     }
     Ok(snapshots)
+}
+
+/// Read the advertised default branch. If the remote omits symbolic HEAD,
+/// return `None`; malformed or failed advertisements are errors.
+pub fn default_branch(remote: &str) -> Result<Option<String>, String> {
+    let mut command = Command::new("git");
+    command.args([
+        OsStr::new("ls-remote"),
+        OsStr::new("--symref"),
+        OsStr::new("--"),
+        OsStr::new(remote),
+        OsStr::new("HEAD"),
+    ]);
+    let output = checked(run(command, None)?, "read remote default branch")?;
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| "remote symbolic HEAD is not UTF-8".to_owned())?;
+    let mut default = None;
+    for line in text.lines() {
+        if let Some(target) = line.strip_prefix("ref: ") {
+            let (target, label) = target
+                .split_once('\t')
+                .ok_or_else(|| format!("malformed remote symbolic HEAD: {line:?}"))?;
+            if label != "HEAD" {
+                return Err(format!("unexpected remote symbolic HEAD label: {label}"));
+            }
+            let branch = target
+                .strip_prefix("refs/heads/")
+                .filter(|branch| !branch.is_empty())
+                .ok_or_else(|| format!("unexpected remote symbolic HEAD target: {target}"))?;
+            if default.replace(branch.to_owned()).is_some() {
+                return Err("remote advertised multiple default branches".into());
+            }
+        }
+    }
+    Ok(default)
 }
 
 fn is_ancestor(git_dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -185,6 +202,27 @@ fn is_ancestor(git_dir: &Path, ancestor: &str, descendant: &str) -> Result<bool,
             String::from_utf8_lossy(&output.stderr).trim()
         )),
     }
+}
+
+fn independent_commits(git_dir: &Path, oids: &[String]) -> Result<BTreeSet<String>, String> {
+    if oids.is_empty() {
+        return Err("cannot find independent commits for an empty group".into());
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["merge-base", "--independent"])
+        .args(oids);
+    let output = run(command, None)?;
+    let output = checked(output, "find maximal branch tips")?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "maximal tip list is not UTF-8".to_owned())?;
+    let independent = text.lines().map(str::to_owned).collect::<BTreeSet<_>>();
+    if independent.is_empty() || independent.iter().any(|oid| !oids.contains(oid)) {
+        return Err("git returned an invalid maximal tip set".into());
+    }
+    Ok(independent)
 }
 
 fn fetch_heads(remote: &str, git_dir: &Path, filter_blobs: bool) -> Result<Output, String> {
@@ -513,6 +551,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn discovers_advertised_default_branch() {
+        let fixture = Fixture::new();
+        test_git(
+            Some(&fixture.work),
+            [
+                "push",
+                "--quiet",
+                fixture.remote.to_str().unwrap(),
+                "HEAD:refs/heads/stable",
+            ],
+        );
+        test_git(
+            None,
+            [
+                "--git-dir",
+                fixture.remote.to_str().unwrap(),
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/stable",
+            ],
+        );
+        assert_eq!(
+            default_branch(fixture.remote.to_str().unwrap()).unwrap(),
+            Some("stable".into())
+        );
+    }
+
     fn test_git<const N: usize>(cwd: Option<&Path>, args: [&str; N]) -> Output {
         let mut command = Command::new("git");
         command.args(args);
@@ -553,15 +619,13 @@ mod tests {
             .unwrap();
         assert_ne!(older.oid, newer.oid);
         assert_eq!(older.tree_oid, newer.tree_oid);
-        assert_eq!(older.commit_count, 2);
-        assert_eq!(newer.commit_count, 3);
         // Commit count is not ancestry evidence: these tips fork from main.
         assert!(older.contained_by.is_empty());
         assert!(newer.contained_by.is_empty());
     }
 
     #[test]
-    fn tied_tree_branches_have_equal_counts_and_slashes_are_preserved() {
+    fn divergent_same_tree_branches_and_slashes_are_preserved() {
         let fixture = Fixture::new();
         let base = String::from_utf8(test_git(Some(&fixture.work), ["rev-parse", "HEAD"]).stdout)
             .unwrap()
@@ -582,18 +646,17 @@ mod tests {
             .find(|branch| branch.name == "topic/two")
             .unwrap();
         assert_eq!(one.tree_oid, two.tree_oid);
-        assert_eq!(one.commit_count, two.commit_count);
         assert_eq!(one.name, "topic/one");
         assert_eq!(two.name, "topic/two");
     }
 
     #[test]
-    fn unique_tree_branches_skip_commit_count_walk() {
+    fn unique_tree_branches_have_no_containment_witness() {
         let fixture = Fixture::new();
         fixture.publish();
         let snapshots = fetch_remote_snapshots(fixture.remote.to_str().unwrap()).unwrap();
         assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].commit_count, 0);
+        assert!(snapshots[0].contained_by.is_empty());
     }
 
     #[test]
@@ -605,16 +668,8 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].oid, snapshots[1].oid);
         assert_eq!(snapshots[0].tree_oid, snapshots[1].tree_oid);
-        assert_eq!(snapshots[0].commit_count, 1);
-        assert_eq!(snapshots[1].commit_count, 1);
-        assert_eq!(
-            snapshots[0].contained_by,
-            [snapshots[1].name.clone()].into()
-        );
-        assert_eq!(
-            snapshots[1].contained_by,
-            [snapshots[0].name.clone()].into()
-        );
+        assert!(snapshots[0].contained_by.is_empty());
+        assert!(snapshots[1].contained_by.is_empty());
     }
 
     #[test]
@@ -627,15 +682,32 @@ mod tests {
         fixture.branch_at_current("topic/short", "short empty commit");
         test_git(
             Some(&fixture.work),
+            ["checkout", "--quiet", "-b", "topic/mid"],
+        );
+        test_git(
+            Some(&fixture.work),
             [
                 "commit",
                 "--quiet",
                 "--allow-empty",
                 "-m",
-                "longer empty commit",
+                "middle empty commit",
             ],
         );
-        test_git(Some(&fixture.work), ["branch", "topic/long"]);
+        test_git(
+            Some(&fixture.work),
+            ["checkout", "--quiet", "-b", "topic/long"],
+        );
+        test_git(
+            Some(&fixture.work),
+            [
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "longest empty commit",
+            ],
+        );
         test_git(Some(&fixture.work), ["checkout", "--quiet", base.as_str()]);
         fixture.publish();
 
@@ -649,8 +721,8 @@ mod tests {
             .find(|branch| branch.name == "topic/long")
             .unwrap();
         assert_eq!(short.tree_oid, long.tree_oid);
-        assert_eq!(short.commit_count + 1, long.commit_count);
         assert!(short.contained_by.contains("topic/long"));
+        assert_eq!(short.contained_by.len(), 1);
         assert!(!long.contained_by.contains("topic/short"));
     }
 }
