@@ -14,4 +14,4 @@ State defaults to `~/.local/share/find-and-recovery`; pass `--state PATH` to iso
 
 Cleanup processes repositories serially, rechecks local refs and registered worktrees, removes linked worktrees first, then removes only the exact owning clone path. Shared stores, nested repositories, incomplete inventory, and failed pushes block removal.
 
-After cleanup, `dedupe` compares remote branch tip commit IDs and can delete only exact duplicate recovery refs created by this run. It protects `main`, `master`, and the advertised default branch; deletion uses regular `git push --delete`, never force. Run the disposable fixture suite with `cargo test` before using the CLI.
+`dedupe` compares exact remote branch tip commit IDs. It previews duplicate groups, then can remove only redundant `recovery/` refs; it retains at least one ref per commit and protects `main`, `master`, and the advertised default branch. Deletion uses regular `git push --delete`, never force. Run the disposable fixture suite with `cargo test` before using the CLI.

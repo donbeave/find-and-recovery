@@ -1177,15 +1177,12 @@ fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), Stri
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .map_err(|e| e.to_string())?;
     use std::io::Write;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|e| e.to_string())?;
-    }
+    let mut stdin = child.stdin.take().ok_or("cat-file stdin unavailable")?;
+    let input_writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
     let stdout = child.stdout.take().ok_or("cat-file stdout unavailable")?;
     let mut reader = BufReader::new(stdout);
     let mut header = String::new();
@@ -1215,6 +1212,10 @@ fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), Stri
             return Err("malformed object terminator".into());
         }
     }
+    input_writer
+        .join()
+        .map_err(|_| "cat-file input writer panicked")?
+        .map_err(|e| format!("cannot write cat-file input: {e}"))?;
     if !child.wait().map_err(|e| e.to_string())?.success() {
         return Err("object scan incomplete".into());
     }
@@ -2056,10 +2057,54 @@ fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
     if refs != r.refs {
         return Err("local refs changed since inventory".into());
     }
-    let stashes = git(owner, &["stash", "list", "--format=%H %gd %gs"])?
+    let stashes = if r.kind == "bare" {
+        Vec::new()
+    } else {
+        git(owner, &["stash", "list", "--format=%H %gd %gs"])?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    if r.kind == "bare" {
+        let bare_stashes = git(
+            owner,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/stash",
+            ],
+        )?
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+        if !stashes.is_empty() || bare_stashes != r.stashes {
+            return Err("bare repository stash refs changed since inventory".into());
+        }
+        let worktrees = parse_worktrees(owner)?;
+        if worktrees.len() != r.worktrees.len()
+            || worktrees
+                .iter()
+                .zip(&r.worktrees)
+                .any(|(current, expected)| {
+                    current.path != expected.path
+                        || current.head != expected.head
+                        || current.branch != expected.branch
+                        || current.bare != expected.bare
+                })
+        {
+            return Err("bare repository worktree registrations changed".into());
+        }
+        for saved in &r.saved {
+            let reference = format!("refs/heads/{}", saved.remote_ref);
+            if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+                return Err(format!(
+                    "pushed ref missing or changed: {}",
+                    saved.remote_ref
+                ));
+            }
+        }
+        return Ok(());
+    }
     if stashes != r.stashes {
         return Err("stash list changed since inventory".into());
     }
@@ -2199,6 +2244,24 @@ fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<
         return Err("repository changed while removing worktrees".into());
     }
     let root = Path::new(&root_before.path);
+    if r.kind == "bare" {
+        for saved in &r.saved {
+            let reference = format!("refs/heads/{}", saved.remote_ref);
+            if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+                return Err(format!(
+                    "pushed ref changed immediately before deletion: {}",
+                    saved.remote_ref
+                ));
+            }
+        }
+        if filesystem_identity(&owner) != r.device.zip(r.inode) {
+            return Err("repository device/inode changed immediately before deletion".into());
+        }
+        fs::remove_dir_all(&owner)
+            .map_err(|e| format!("remove exact bare repository {}: {e}", owner.display()))?;
+        removed.push(owner.to_string_lossy().into_owned());
+        return Ok(removed);
+    }
     let status = git(
         root,
         &[
@@ -2258,11 +2321,23 @@ fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<
     Ok(removed)
 }
 fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
-    if m.repositories.iter().any(|repo| repo.deletion != "deleted") {
-        return Err("dedupe requires local cleanup to finish for all manifest repositories".into());
-    }
     let remote = m.remote.clone();
     reject_remote_url_rewrite(&remote, None)?;
+    let push_context = tempfile::Builder::new()
+        .prefix("find-and-recovery-dedupe-")
+        .tempdir()
+        .map_err(|e| format!("create isolated push context: {e}"))?;
+    out(
+        &[
+            "git".into(),
+            "init".into(),
+            "--bare".into(),
+            "-q".into(),
+            push_context.path().to_string_lossy().into_owned(),
+        ],
+        None,
+        &[],
+    )?;
     let heads = out(
         &[
             "git".into(),
@@ -2300,16 +2375,14 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
             .next()
             .map(str::to_owned)
     });
-    let ownership = m
-        .repositories
+    let ownership = branches
         .iter()
-        .filter(|repo| repo.deletion == "deleted")
-        .flat_map(|repo| repo.saved.iter())
-        .filter(|saved| recovery_ref_is_owned_name(&saved.remote_ref))
-        .map(|saved| dedupe::RecoveryRef {
-            name: saved.remote_ref.clone(),
-            created_by_this_run: saved.created_by_this_run,
-        });
+        .filter(|branch| recovery_ref_is_owned_name(&branch.name))
+        .map(|branch| dedupe::RecoveryRef {
+            name: branch.name.clone(),
+            managed: true,
+        })
+        .collect::<Vec<_>>();
     let mut protected: BTreeSet<String> = ["main".into(), "master".into()].into_iter().collect();
     if let Some(name) = default {
         protected.insert(name);
@@ -2357,13 +2430,13 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
                     "--delete".into(),
                     name.clone(),
                 ],
-                None,
+                Some(push_context.path()),
                 &[],
             )?;
             for repo in &mut m.repositories {
-                if repo.deletion == "deleted" {
+                if repo.deletion == "deleted" || repo.deletion.starts_with("blocked") {
                     for saved in &mut repo.saved {
-                        if saved.remote_ref == name && saved.created_by_this_run {
+                        if saved.remote_ref == name {
                             saved.retained_ref = Some(keep.clone());
                         }
                     }
