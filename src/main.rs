@@ -414,6 +414,47 @@ fn snapshot_fingerprint(w: &Worktree) -> String {
         .as_bytes(),
     )
 }
+fn skipped_tree_path(value: &str) -> Option<&Path> {
+    value
+        .strip_prefix("<nested-repository scan skipped for generated tree: ")?
+        .strip_suffix('>')
+        .map(Path::new)
+}
+fn ensure_no_nested_git(root: &Path) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "generated tree is missing or unreadable: {}",
+            root.display()
+        ));
+    }
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_type().is_dir())
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.depth() > 0 {
+            let marker = entry.path().join(".git");
+            if marker.exists() || marker.is_symlink() {
+                return Err(format!(
+                    "nested repository blocks cleanup: {}",
+                    marker.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+fn validate_nested_inventory(worktree: &Worktree) -> Result<(), String> {
+    for item in &worktree.nested_repositories {
+        if let Some(path) = skipped_tree_path(item) {
+            ensure_no_nested_git(path)?;
+        } else {
+            return Err(format!("nested repository blocks cleanup: {item}"));
+        }
+    }
+    Ok(())
+}
 fn inventory_worktree(
     owner: &Path,
     common: &Path,
@@ -1104,6 +1145,8 @@ fn push_ref(remote: &str, repo: &Path, oid: &str, reference: &str) -> Result<boo
     }
     let a = vec![
         "git".into(),
+        "-c".into(),
+        "http.version=HTTP/1.1".into(),
         "-C".into(),
         repo.to_string_lossy().into_owned(),
         "push".into(),
@@ -1121,6 +1164,7 @@ fn push_ref(remote: &str, repo: &Path, oid: &str, reference: &str) -> Result<boo
 }
 fn preserve(m: &mut Manifest) -> Result<(), String> {
     for r in &mut m.repositories {
+        let prior_saved = r.saved.clone();
         r.preservation = "blocked".into();
         r.saved.clear();
         r.verification_error = None;
@@ -1231,11 +1275,15 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 if worktree.bare {
                     continue;
                 }
-                if !worktree.nested_repositories.is_empty() || !worktree.ignored.is_empty() {
+                if !worktree.ignored.is_empty() {
                     failure = Some(format!(
-                        "worktree has ignored content or nested repositories; snapshot blocked: {}",
+                        "worktree has ignored content; snapshot blocked: {}",
                         worktree.path
                     ));
+                    break;
+                }
+                if let Err(error) = validate_nested_inventory(&worktree) {
+                    failure = Some(error);
                     break;
                 }
                 if worktree.detached {
@@ -1291,6 +1339,15 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         if let Some(error) = failure {
             r.preservation = "blocked".into();
             r.verification_error = Some(error);
+        }
+        for saved in &mut r.saved {
+            if prior_saved.iter().any(|previous| {
+                previous.remote_ref == saved.remote_ref
+                    && previous.commit == saved.commit
+                    && previous.created_by_this_run
+            }) {
+                saved.created_by_this_run = true;
+            }
         }
     }
     Ok(())
@@ -1397,20 +1454,8 @@ fn save_worktree(
     if wt.bare {
         return Ok(());
     }
+    validate_nested_inventory(wt)?;
     let path = Path::new(&wt.path);
-    let scan = vec![
-        "gitleaks".into(),
-        "dir".into(),
-        "--redact".into(),
-        "--no-banner".into(),
-        path.to_string_lossy().into_owned(),
-    ];
-    if out(&scan, None, &[]).is_err() {
-        return Err(format!(
-            "working-file secret scan blocked upload: {}",
-            wt.path
-        ));
-    }
     let head = wt.head.as_deref().unwrap_or("");
     let staged = git(path, &["write-tree"])?.trim().to_owned();
     let head_tree = if head.is_empty() {
@@ -1423,6 +1468,19 @@ fn save_worktree(
     let full = write_worktree_tree(path, head)?;
     if staged == head_tree && full == head_tree {
         return Ok(());
+    }
+    let scan = vec![
+        "gitleaks".into(),
+        "dir".into(),
+        "--redact".into(),
+        "--no-banner".into(),
+        path.to_string_lossy().into_owned(),
+    ];
+    if out(&scan, None, &[]).is_err() {
+        return Err(format!(
+            "working-file secret scan blocked upload: {}",
+            wt.path
+        ));
     }
     let mut staged_commit = None;
     if staged != head_tree && staged != full {
@@ -1560,10 +1618,12 @@ fn cleanup_blocker(r: &Repository) -> Option<String> {
     if r.kind != "clone" && r.kind != "bare" {
         return Some("blocked-repository-kind".into());
     }
-    if r.worktrees
-        .iter()
-        .any(|w| w.foreign_registration || !w.nested_repositories.is_empty())
-    {
+    if r.worktrees.iter().any(|w| {
+        w.foreign_registration
+            || w.nested_repositories
+                .iter()
+                .any(|item| skipped_tree_path(item).is_none())
+    }) {
         return Some("blocked-worktree-dependency".into());
     }
     for b in &r.branches {
@@ -1669,6 +1729,7 @@ fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
         {
             return Err(format!("worktree registration changed: {}", expected.path));
         }
+        validate_nested_inventory(expected)?;
         let path = Path::new(&current.path);
         let status = git(
             path,
