@@ -266,10 +266,12 @@ mod tests {
 
     #[test]
     fn different_root_trees_are_not_grouped() {
-        assert!(tree_duplicate_groups([
-            tree_snapshot("one", "a", "tree-one", 2),
-            tree_snapshot("two", "b", "tree-two", 9),
-        ])
-        .is_empty());
+        assert!(
+            tree_duplicate_groups([
+                tree_snapshot("one", "a", "tree-one", 2),
+                tree_snapshot("two", "b", "tree-two", 9),
+            ])
+            .is_empty()
+        );
     }
 }

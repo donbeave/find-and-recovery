@@ -137,7 +137,10 @@ fn dedupe_execute_fails_closed_without_changing_remote_refs() {
         ])
         .output()
         .expect("start find-and-recovery");
-    assert!(!output.status.success(), "dedupe --execute must fail closed");
+    assert!(
+        !output.status.success(),
+        "dedupe --execute must fail closed"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("remote branch deletion is forbidden"),
         "unexpected error: {}",

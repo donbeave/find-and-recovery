@@ -554,6 +554,9 @@ fn branches_only_cleanup_rechecks_worktree_state_after_preview() {
         "cleanup failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(work.exists(), "branch-only preservation cannot authorize deletion");
+    assert!(
+        work.exists(),
+        "branch-only preservation cannot authorize deletion"
+    );
     assert!(work.join("after-preview.txt").exists());
 }
