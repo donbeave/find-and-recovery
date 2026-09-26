@@ -61,7 +61,7 @@ fn write_manifest(state: &Path, remote: &Path) {
 }
 
 #[test]
-fn dedupe_retains_unowned_and_different_oid_branches() {
+fn dedupe_execute_fails_closed_without_changing_remote_refs() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote.git");
     let work = temp.path().join("work");
@@ -137,11 +137,11 @@ fn dedupe_retains_unowned_and_different_oid_branches() {
         ])
         .output()
         .expect("start find-and-recovery");
+    assert!(!output.status.success(), "dedupe --execute must fail closed");
     assert!(
-        output.status.success(),
-        "dedupe failed: {}\n{}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stderr).contains("remote branch deletion is forbidden"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     assert_eq!(
@@ -169,7 +169,8 @@ fn dedupe_retains_unowned_and_different_oid_branches() {
                 &format!("refs/archive/find-and-recovery/dedupe/{oid}")
             )
             .as_deref(),
-            None
+            None,
+            "failed dedupe execution created archive refs"
         );
     }
 }

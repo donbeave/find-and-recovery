@@ -4,10 +4,18 @@
 //! SHA-256 object IDs. Validate all inputs and confirm every payload exists
 //! before starting the upload, so a missing local object cannot be skipped.
 
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+/// LFS pointer metadata required to prove local bytes before upload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LfsPayload {
+    pub oid: String,
+    pub size: u64,
+}
 
 /// Push all supplied LFS object IDs in one `git lfs push` invocation.
 ///
@@ -16,6 +24,67 @@ use std::process::{Command, Output, Stdio};
 /// filenames, endpoint credentials, or other sensitive details.
 pub fn push_lfs_objects(repo: &Path, remote: &str, oids: &[String]) -> Result<(), String> {
     push_lfs_objects_with_git(OsStr::new("git"), repo, remote, oids)
+}
+
+/// Validate every local payload against its pointer, then upload all objects
+/// in one batch. Missing, corrupt, or wrong-sized data blocks the upload.
+pub fn push_lfs_payloads(repo: &Path, remote: &str, payloads: &[LfsPayload]) -> Result<(), String> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    let mut sorted = payloads.to_vec();
+    sorted.sort_by(|left, right| left.oid.cmp(&right.oid));
+    for pair in sorted.windows(2) {
+        if pair[0].oid == pair[1].oid {
+            return Err("duplicate Git LFS object ID in upload batch".into());
+        }
+    }
+    let media_dir = local_media_dir(OsStr::new("git"), repo)?;
+    for payload in &sorted {
+        if payload.oid.len() != 64 || !payload.oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid Git LFS object ID; expected 64 hexadecimal characters".into());
+        }
+        verify_local_payload(&media_dir, payload)?;
+    }
+    let oids = sorted
+        .into_iter()
+        .map(|payload| payload.oid)
+        .collect::<Vec<_>>();
+    push_lfs_objects(repo, remote, &oids)
+}
+
+fn verify_local_payload(media_dir: &Path, payload: &LfsPayload) -> Result<(), String> {
+    let path = payload_path(media_dir, &payload.oid);
+    let mut file = std::fs::File::open(&path)
+        .map_err(|_| format!("missing local Git LFS payload: {}", payload.oid))?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| format!("cannot read local Git LFS payload: {}", payload.oid))?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or("Git LFS payload size overflow")?;
+        hasher.update(&buffer[..read]);
+    }
+    if format!("{:x}", hasher.finalize()) != payload.oid.to_ascii_lowercase() {
+        return Err(format!(
+            "local Git LFS payload SHA-256 mismatch: {}",
+            payload.oid
+        ));
+    }
+    if size != payload.size {
+        return Err(format!(
+            "local Git LFS payload size mismatch: {}",
+            payload.oid
+        ));
+    }
+    Ok(())
 }
 
 fn push_lfs_objects_with_git(

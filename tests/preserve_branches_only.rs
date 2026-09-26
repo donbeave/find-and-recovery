@@ -535,7 +535,13 @@ fn branches_only_cleanup_rechecks_worktree_state_after_preview() {
     }
     let manifest: Value =
         serde_json::from_slice(&fs::read(state.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["repositories"][0]["deletion"], "eligible");
+    assert!(
+        manifest["repositories"][0]["deletion"]
+            .as_str()
+            .unwrap()
+            .starts_with("blocked-"),
+        "branch-only push must not authorize deletion"
+    );
     fs::write(work.join("after-preview.txt"), "new content\n").unwrap();
 
     let output = branch_only_command(
@@ -548,6 +554,6 @@ fn branches_only_cleanup_rechecks_worktree_state_after_preview() {
         "cleanup failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(work.exists(), "clone with post-preview changes was deleted");
+    assert!(work.exists(), "branch-only preservation cannot authorize deletion");
     assert!(work.join("after-preview.txt").exists());
 }

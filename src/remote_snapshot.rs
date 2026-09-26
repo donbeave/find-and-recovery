@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 /// Fetch every remote head into a fresh isolated bare repository and return
-/// its tip, tree, and (for duplicate-tree groups only) reachable commit count.
+/// its tip, tree, and reachable commit count for duplicate-tree groups.
 ///
 /// Any remote movement during the fetch, malformed ref output, missing commit
 /// or tree object, or Git failure aborts the snapshot.
@@ -76,51 +76,23 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
             .push((branch.to_owned(), oid.clone()));
     }
 
-    let mut contained_oids = BTreeMap::<String, String>::new();
-    for group in by_tree.values().filter(|group| group.len() > 1) {
-        let group_oids = group
-            .iter()
-            .map(|(_, oid)| oid.clone())
-            .collect::<BTreeSet<_>>();
-        // Git computes the maximal (pairwise incomparable) tips in one
-        // process. Every omitted tip is an ancestor of at least one maximal
-        // tip. Map each omitted OID to one verified maximal keeper; the
-        // planner only needs one witness to prove safe deletion.
-        let unique_oids = group_oids.into_iter().collect::<Vec<_>>();
-        let maximal_oids = independent_commits(&git_dir, &unique_oids)?;
-        let mut maximal_targets = maximal_oids
-            .iter()
-            .map(|oid| {
-                let representative = group
-                    .iter()
-                    .filter(|(_, branch_oid)| branch_oid == oid)
-                    .map(|(name, _)| name)
-                    .min()
-                    .cloned()
-                    .ok_or_else(|| format!("no branch name for maximal commit {oid}"))?;
-                Ok((oid.clone(), representative))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        maximal_targets.sort_by(|(_, left_name), (_, right_name)| left_name.cmp(right_name));
-
-        for oid in &unique_oids {
-            if maximal_oids.contains(oid) {
-                continue;
-            }
-            let mut keeper = None;
-            for (descendant_oid, representative) in &maximal_targets {
-                if is_ancestor(&git_dir, oid, descendant_oid)? {
-                    keeper = Some(representative.clone());
-                    break;
-                }
-            }
-            let keeper = keeper.ok_or_else(|| {
-                format!(
-                    "merge-base --independent omitted {oid}, but no maximal descendant was verified"
-                )
-            })?;
-            contained_oids.insert(oid.clone(), keeper);
-        }
+    let mut counts = BTreeMap::<String, u64>::new();
+    let unique_oids = fetched.values().cloned().collect::<BTreeSet<_>>();
+    for oid in unique_oids {
+        let output = git_in(
+            Some(&git_dir),
+            [
+                OsStr::new("rev-list"),
+                OsStr::new("--count"),
+                OsStr::new(&oid),
+            ],
+        )?;
+        let count = String::from_utf8(output.stdout)
+            .map_err(|_| format!("non-UTF-8 commit count for {oid}"))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("invalid commit count for {oid}: {error}"))?;
+        counts.insert(oid, count);
     }
 
     let mut snapshots = Vec::with_capacity(fetched.len());
@@ -133,12 +105,13 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
             .get(&oid)
             .ok_or_else(|| format!("missing tree result for commit {oid}"))?
             .clone();
-        let containing_branches = contained_oids.get(&oid).cloned().into_iter().collect();
         snapshots.push(BranchSnapshot {
             name,
             oid: oid.clone(),
             tree_oid,
-            contained_by: containing_branches,
+            commit_count: *counts
+                .get(&oid)
+                .ok_or_else(|| format!("missing commit count for {oid}"))?,
         });
     }
 
@@ -182,47 +155,6 @@ pub fn default_branch(remote: &str) -> Result<Option<String>, String> {
         }
     }
     Ok(default)
-}
-
-fn is_ancestor(git_dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
-    let mut command = Command::new("git");
-    command.arg("--git-dir").arg(git_dir).args([
-        "merge-base",
-        "--is-ancestor",
-        ancestor,
-        descendant,
-    ]);
-    let output = run(command, None)?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(format!(
-            "check ancestry {ancestor} -> {descendant} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-    }
-}
-
-fn independent_commits(git_dir: &Path, oids: &[String]) -> Result<BTreeSet<String>, String> {
-    if oids.is_empty() {
-        return Err("cannot find independent commits for an empty group".into());
-    }
-    let mut command = Command::new("git");
-    command
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(["merge-base", "--independent"])
-        .args(oids);
-    let output = run(command, None)?;
-    let output = checked(output, "find maximal branch tips")?;
-    let text = std::str::from_utf8(&output.stdout)
-        .map_err(|_| "maximal tip list is not UTF-8".to_owned())?;
-    let independent = text.lines().map(str::to_owned).collect::<BTreeSet<_>>();
-    if independent.is_empty() || independent.iter().any(|oid| !oids.contains(oid)) {
-        return Err("git returned an invalid maximal tip set".into());
-    }
-    Ok(independent)
 }
 
 fn fetch_heads(remote: &str, git_dir: &Path, filter_blobs: bool) -> Result<Output, String> {
@@ -468,8 +400,9 @@ fn run(mut command: Command, input: Option<&[u8]>) -> Result<Output, String> {
 }
 
 fn isolated(command: &mut Command) -> &mut Command {
-    // Keep SSH/authentication settings intact; remove only variables that can
-    // redirect object lookup or select a caller's repository/index.
+    // Keep SSH/authentication settings intact; remove variables that can
+    // redirect object lookup, repository selection, or Git configuration.
+    strip_git_config_environment(command, std::env::vars_os().map(|(name, _)| name));
     for name in [
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -486,6 +419,31 @@ fn isolated(command: &mut Command) -> &mut Command {
     command
 }
 
+fn strip_git_config_environment(
+    command: &mut Command,
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    // Always clear singleton overrides, including ones added directly to a
+    // Command before this helper is called. Remove every inherited indexed
+    // KEY_n / VALUE_n override as well.
+    for name in [
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    ] {
+        command.env_remove(name);
+    }
+    for name in names {
+        if name.to_string_lossy().starts_with("GIT_CONFIG_") {
+            command.env_remove(name);
+        }
+    }
+}
+
 fn checked(output: Output, operation: &str) -> Result<Output, String> {
     if output.status.success() {
         Ok(output)
@@ -493,9 +451,32 @@ fn checked(output: Output, operation: &str) -> Result<Output, String> {
         Err(format!(
             "{operation} failed ({}): {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            redact_url_credentials(String::from_utf8_lossy(&output.stderr).trim())
         ))
     }
+}
+
+fn redact_url_credentials(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(scheme_end) = rest.find("://") {
+        let authority_start = scheme_end + 3;
+        output.push_str(&rest[..authority_start]);
+        let authority_end = rest[authority_start..]
+            .find(['/', '?', '#', ' ', '\t', '\r', '\n'])
+            .map(|offset| authority_start + offset)
+            .unwrap_or(rest.len());
+        let authority = &rest[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            output.push_str("<redacted>@");
+            output.push_str(&authority[at + 1..]);
+        } else {
+            output.push_str(authority);
+        }
+        rest = &rest[authority_end..];
+    }
+    output.push_str(rest);
+    output
 }
 
 #[cfg(test)]
@@ -619,9 +600,9 @@ mod tests {
             .unwrap();
         assert_ne!(older.oid, newer.oid);
         assert_eq!(older.tree_oid, newer.tree_oid);
-        // Commit count is not ancestry evidence: these tips fork from main.
-        assert!(older.contained_by.is_empty());
-        assert!(newer.contained_by.is_empty());
+        // Higher reachable count is independent of ancestry containment.
+        assert_eq!(older.commit_count, 2);
+        assert_eq!(newer.commit_count, 3);
     }
 
     #[test]
@@ -646,17 +627,18 @@ mod tests {
             .find(|branch| branch.name == "topic/two")
             .unwrap();
         assert_eq!(one.tree_oid, two.tree_oid);
+        assert_eq!(one.commit_count, two.commit_count);
         assert_eq!(one.name, "topic/one");
         assert_eq!(two.name, "topic/two");
     }
 
     #[test]
-    fn unique_tree_branches_have_no_containment_witness() {
+    fn unique_tree_branch_has_accurate_reachable_count() {
         let fixture = Fixture::new();
         fixture.publish();
         let snapshots = fetch_remote_snapshots(fixture.remote.to_str().unwrap()).unwrap();
         assert_eq!(snapshots.len(), 1);
-        assert!(snapshots[0].contained_by.is_empty());
+        assert_eq!(snapshots[0].commit_count, 1);
     }
 
     #[test]
@@ -668,12 +650,12 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].oid, snapshots[1].oid);
         assert_eq!(snapshots[0].tree_oid, snapshots[1].tree_oid);
-        assert!(snapshots[0].contained_by.is_empty());
-        assert!(snapshots[1].contained_by.is_empty());
+        assert_eq!(snapshots[0].commit_count, 1);
+        assert_eq!(snapshots[1].commit_count, 1);
     }
 
     #[test]
-    fn longer_linear_same_tree_tip_reports_containment() {
+    fn reachable_commit_counts_rank_linear_same_tree_tips() {
         let fixture = Fixture::new();
         let base = String::from_utf8(test_git(Some(&fixture.work), ["rev-parse", "HEAD"]).stdout)
             .unwrap()
@@ -721,8 +703,79 @@ mod tests {
             .find(|branch| branch.name == "topic/long")
             .unwrap();
         assert_eq!(short.tree_oid, long.tree_oid);
-        assert!(short.contained_by.contains("topic/long"));
-        assert_eq!(short.contained_by.len(), 1);
-        assert!(!long.contained_by.contains("topic/short"));
+        let mid = snapshots
+            .iter()
+            .find(|branch| branch.name == "topic/mid")
+            .unwrap();
+        assert_eq!(short.commit_count + 2, long.commit_count);
+        assert_eq!(short.commit_count + 1, mid.commit_count);
+    }
+
+    #[test]
+    fn poisoned_git_config_environment_is_ignored_for_local_remote() {
+        let fixture = Fixture::new();
+        fixture.publish();
+        let remote = fixture.remote.to_string_lossy().into_owned();
+        let poison_url = "https://poison-user:poison-secret@127.0.0.1:1/poison/";
+        let key = format!("url.{poison_url}.insteadOf");
+        let config = format!("[url \"{poison_url}\"]\n\tinsteadOf = {remote}\n");
+        let config_path = fixture._dir.path().join("poison.gitconfig");
+        std::fs::write(&config_path, &config).unwrap();
+        let config_path = config_path.to_string_lossy().into_owned();
+
+        // Prove this config would redirect the local remote if it reached Git.
+        let poisoned = Command::new("git")
+            .args(["ls-remote", "--heads", "--", &remote])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", &key)
+            .env("GIT_CONFIG_VALUE_0", &remote)
+            .output()
+            .unwrap();
+        assert!(!poisoned.status.success());
+
+        let parameters = format!("'{key}={remote}'");
+        let mut command = Command::new("git");
+        command
+            .args(["ls-remote", "--heads", "--", &remote])
+            .env("GIT_CONFIG", &config_path)
+            .env("GIT_CONFIG_GLOBAL", &config_path)
+            .env("GIT_CONFIG_SYSTEM", &config_path)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", &key)
+            .env("GIT_CONFIG_VALUE_0", &remote)
+            .env("GIT_CONFIG_PARAMETERS", parameters);
+        strip_git_config_environment(
+            &mut command,
+            [
+                "GIT_CONFIG".into(),
+                "GIT_CONFIG_GLOBAL".into(),
+                "GIT_CONFIG_SYSTEM".into(),
+                "GIT_CONFIG_COUNT".into(),
+                "GIT_CONFIG_PARAMETERS".into(),
+                "GIT_CONFIG_KEY_0".into(),
+                "GIT_CONFIG_VALUE_0".into(),
+            ],
+        );
+        let sanitized = command.output().unwrap();
+        assert!(
+            sanitized.status.success(),
+            "sanitized local ls-remote failed: {}",
+            String::from_utf8_lossy(&sanitized.stderr)
+        );
+        assert!(!sanitized.stdout.is_empty());
+    }
+
+    #[test]
+    fn remote_failure_diagnostics_redact_embedded_credentials() {
+        let sample =
+            redact_url_credentials("fatal: https://alice:secret@example.invalid/repo.git: denied");
+        assert!(sample.contains("https://<redacted>@example.invalid/repo.git"));
+        assert!(!sample.contains("alice"));
+        assert!(!sample.contains("secret"));
+
+        let error =
+            fetch_remote_snapshots("https://alice:secret@127.0.0.1:1/private.git").unwrap_err();
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("secret"));
     }
 }

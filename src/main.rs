@@ -1,3 +1,7 @@
+#[path = "lfs_batch.rs"]
+mod lfs_batch;
+#[path = "remote_lfs.rs"]
+mod remote_lfs;
 mod conditional_delete;
 mod dedupe;
 mod remote_snapshot;
@@ -125,9 +129,14 @@ struct Repository {
     lfs_files: Vec<String>,
     #[serde(default)]
     lfs_preservation: String,
+    #[serde(default)]
+    lfs_objects: Vec<remote_lfs::LfsObject>,
     inventory_complete: bool,
     inventory_errors: Vec<String>,
     saved: Vec<Saved>,
+    /// Per-object/per-snapshot failures retained for machine-readable review.
+    #[serde(default)]
+    preservation_errors: Vec<String>,
     preservation: String,
     verification: String,
     verification_error: Option<String>,
@@ -319,11 +328,13 @@ fn target_path(path: &Path, remote: &str) -> bool {
 
 fn branch_upstreams_target_remote(path: &Path, target: &str) -> Result<bool, String> {
     let origin_urls = git(path, &["config", "--get-all", "remote.origin.url"]).unwrap_or_default();
-    if origin_urls
-        .lines()
-        .any(|url| canon_url(url) == canon_url(target))
-    {
-        return Ok(true);
+    let mut matches_target = false;
+    let origin_urls = origin_urls.lines().collect::<Vec<_>>();
+    if !origin_urls.is_empty() {
+        if origin_urls.iter().any(|url| canon_url(url) != canon_url(target)) {
+            return Ok(false);
+        }
+        matches_target = true;
     }
 
     let refs = git(
@@ -351,8 +362,9 @@ fn branch_upstreams_target_remote(path: &Path, target: &str) -> Result<bool, Str
         if !urls.lines().any(|url| canon_url(url) == canon_url(target)) {
             return Ok(false);
         }
+        matches_target = true;
     }
-    Ok(found_branch)
+    Ok(matches_target && (found_branch || !origin_urls.is_empty()))
 }
 fn common_dir(path: &Path) -> Result<PathBuf, String> {
     let s = git(
@@ -1491,53 +1503,35 @@ fn scan_lfs_payloads(repo: &Path, records: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn push_lfs_payloads(repo: &Path, remote: &str, records: &[String]) -> Result<(), String> {
-    let env = out(
-        &[
-            "git".into(),
-            "-C".into(),
-            repo.to_string_lossy().into_owned(),
-            "lfs".into(),
-            "env".into(),
-        ],
-        None,
-        &[],
-    )?;
-    let media = env
-        .lines()
-        .find_map(|line| line.strip_prefix("LocalMediaDir="))
-        .map(PathBuf::from)
-        .ok_or("Git LFS did not report LocalMediaDir")?;
-    let mut seen = BTreeSet::new();
-    for record in records {
-        let oid = record
-            .split_whitespace()
-            .next()
-            .ok_or("malformed Git LFS inventory entry")?;
-        if !seen.insert(oid.to_owned()) {
-            continue;
-        }
-        if !media.join(&oid[..2]).join(&oid[2..4]).join(oid).is_file() {
-            continue;
-        }
-        out(
-            &[
-                "git".into(),
-                "-C".into(),
-                repo.to_string_lossy().into_owned(),
-                "lfs".into(),
-                "push".into(),
-                "--object-id".into(),
-                remote.into(),
-                oid.into(),
-            ],
-            None,
-            &[],
-        )
-        .map_err(|error| format!("Git LFS object push failed ({oid}): {error}"))?;
+fn preserve_saved_lfs(
+    repo: &Path,
+    remote: &str,
+    saved: &[Saved],
+) -> Result<Vec<remote_lfs::LfsObject>, String> {
+    let commits = saved.iter().map(|entry| entry.commit.clone()).collect::<Vec<_>>();
+    let objects = remote_lfs::inventory_local_lfs_commits(repo, &commits)?;
+    remote_lfs::validate_local_lfs_payloads(repo, &objects)?;
+    if !objects.is_empty() {
+        // Scan only after proving that every referenced payload is present and
+        // matches its pointer. In particular, newly-created snapshots are
+        // included here before their LFS bytes are uploaded.
+        let records = objects
+            .iter()
+            .map(|object| format!("{} payload", object.oid))
+            .collect::<Vec<_>>();
+        scan_lfs_payloads(repo, &records)?;
+        let payloads = objects
+            .iter()
+            .map(|object| lfs_batch::LfsPayload {
+                oid: object.oid.clone(),
+                size: object.size,
+            })
+            .collect::<Vec<_>>();
+        lfs_batch::push_lfs_payloads(repo, remote, &payloads)?;
     }
-    Ok(())
+    Ok(objects)
 }
+
 fn remote_oid(remote: &str, reference: &str) -> Result<Option<String>, String> {
     let a = vec![
         "git".into(),
@@ -1622,11 +1616,14 @@ fn push_ref(remote: &str, repo: &Path, oid: &str, reference: &str) -> Result<boo
         "-C".into(),
         repo.to_string_lossy().into_owned(),
         "push".into(),
+        // The preflight is informative only. An empty lease makes the actual
+        // update create-only, so a concurrent creator cannot be overwritten.
+        format!("--force-with-lease={reference}:"),
         "--porcelain".into(),
         remote.into(),
         format!("{oid}:{reference}"),
     ];
-    let output = out(&a, None, &[])?;
+    let output = out(&a, None, &[("GIT_LFS_SKIP_PUSH", "1")])?;
     let created = output.lines().any(|line| {
         line.starts_with("*")
             && line
@@ -1648,6 +1645,9 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         let prior_saved = r.saved.clone();
         r.preservation = "blocked".into();
         r.saved.clear();
+        r.preservation_errors.clear();
+        r.lfs_objects.clear();
+        r.lfs_preservation = "pending".into();
         r.verification_error = None;
         if temporary_recovery_fixture(Path::new(&r.path)) {
             r.verification_error =
@@ -1675,16 +1675,22 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             .map(|reference| format!("unsupported local ref blocks cleanup: {reference}"));
         let path = PathBuf::from(&r.path);
         let remote = m.remote.clone();
-        if !r.lfs_files.is_empty() {
-            if let Err(error) = scan_lfs_payloads(&path, &r.lfs_files) {
-                r.lfs_preservation = "blocked".into();
-                r.verification_error = Some(error);
+        match branch_upstreams_target_remote(&path, &remote) {
+            Ok(true) => {}
+            Ok(false) => {
+                r.verification_error = Some(
+                    "ambiguous matching remote: origin and local branch upstreams do not all map to the requested target".into(),
+                );
                 continue;
             }
-            r.lfs_preservation = "scanned".into();
-        } else {
-            r.lfs_preservation = "not-required".into();
+            Err(error) => {
+                r.verification_error = Some(format!(
+                    "cannot confirm branch push remote mapping: {error}"
+                ));
+                continue;
+            }
         }
+        r.lfs_preservation = "pending-saved-ref-inventory".into();
         let current_branches = branch_inventory(&path)?;
         let current_worktrees = parse_worktrees(&path)?;
         let heads = |items: &[Worktree]| {
@@ -1725,18 +1731,14 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 (worktree.detached).then(|| worktree.head.clone()).flatten()
             }),
         );
-        if let Err(error) = scan_commits(&path, &scan_oids.into_iter().collect::<Vec<_>>(), &remote)
-        {
-            r.verification_error = Some(error);
-            continue;
-        }
-        if !r.lfs_files.is_empty() {
-            if let Err(error) = push_lfs_payloads(&path, &remote, &r.lfs_files) {
-                r.lfs_preservation = "blocked".into();
-                r.verification_error = Some(error);
-                continue;
+        // Inspect every tip independently. One secret or corrupt object must
+        // block its containing clone, but must not hide which other tips were
+        // safely recoverable or prevent their preservation attempts.
+        let mut failure = None;
+        for oid in scan_oids {
+            if let Err(error) = scan_commit(&path, &oid, &remote) {
+                record_preservation_failure(r, &mut failure, format!("scan {oid}"), error);
             }
-            r.lfs_preservation = "push-succeeded".into();
         }
         let common = r.common_dir.clone();
         let branches = r.branches.clone();
@@ -1760,7 +1762,6 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         }
         let unreachable = r.unreachable_commits.clone();
         let mut mapped = BTreeSet::new();
-        let mut failure = None;
         r.preservation = "complete".into();
         for branch in branches {
             if let Err(error) = save_object(
@@ -1948,9 +1949,44 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 ));
             }
         }
-        if let Some(error) = failure.or(blocker) {
+        if let Some(error) = failure.clone().or(blocker) {
             r.preservation = "blocked".into();
             r.verification_error = Some(error);
+        } else {
+            match preserve_saved_lfs(&path, &remote, &r.saved) {
+                Ok(objects) => {
+                    r.lfs_objects = objects;
+                    r.lfs_preservation = if r.lfs_objects.is_empty() {
+                        "not-required".into()
+                    } else {
+                        "push-succeeded".into()
+                    };
+                    for saved in &mut r.saved {
+                        match push_ref(
+                            &remote,
+                            &path,
+                            &saved.commit,
+                            &format!("refs/heads/{}", saved.remote_ref),
+                        ) {
+                            Ok(created) => {
+                                saved.created_by_this_run = created;
+                                saved.verification = "push-succeeded".into();
+                            }
+                            Err(error) => {
+                                failure.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    r.lfs_preservation = "blocked".into();
+                    failure.get_or_insert(error);
+                }
+            }
+            if let Some(error) = failure {
+                r.preservation = "blocked".into();
+                r.verification_error = Some(error);
+            }
         }
         for saved in &mut r.saved {
             if prior_saved.iter().any(|previous| {
@@ -2068,9 +2104,11 @@ fn preserve_branches_only(m: &mut Manifest) -> Result<(), String> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        if let Err(error) = scan_commits(&path, &branch_oids, &m.remote) {
-            r.verification_error = Some(error);
-            continue;
+        let mut scan_failures = Vec::new();
+        for oid in &branch_oids {
+            if let Err(error) = scan_commit(&path, oid, &m.remote) {
+                scan_failures.push(format!("scan branch tip {oid}: {error}"));
+            }
         }
         r.saved.clear();
 
@@ -2114,7 +2152,12 @@ fn preserve_branches_only(m: &mut Manifest) -> Result<(), String> {
                     });
                 }
                 Err(error) => {
-                    failure.get_or_insert(error);
+                    record_preservation_failure(
+                        r,
+                        &mut failure,
+                        format!("push branch {} {}", branch.name, branch.commit),
+                        error,
+                    );
                 }
             }
         }
@@ -2190,14 +2233,12 @@ fn save_object(
         name,
         oid,
     );
-    let full = format!("refs/heads/{rr}");
-    let owned_remote_ref = push_ref(remote, repo, oid, &full)?;
     r.saved.push(Saved {
         source: kind.into(),
         name: name.into(),
         commit: oid.into(),
         remote_ref: rr,
-        created_by_this_run: owned_remote_ref,
+        created_by_this_run: false,
         retained_ref: None,
         tree: None,
         verification: "push-succeeded".into(),
@@ -2318,13 +2359,12 @@ fn save_worktree(
             &wt.path,
             &commit,
         );
-        let created = push_ref(remote, path, &commit, &format!("refs/heads/{reference}"))?;
         repo.saved.push(Saved {
             source: "staged-snapshot".into(),
             name,
             commit: commit.clone(),
             remote_ref: reference,
-            created_by_this_run: created,
+            created_by_this_run: false,
             retained_ref: None,
             tree: Some(staged.clone()),
             verification: "push-succeeded".into(),
@@ -2346,13 +2386,12 @@ fn save_worktree(
         &wt.path,
         &commit,
     );
-    let created = push_ref(remote, path, &commit, &format!("refs/heads/{reference}"))?;
     repo.saved.push(Saved {
         source: "worktree-snapshot".into(),
         name,
         commit,
         remote_ref: reference,
-        created_by_this_run: created,
+        created_by_this_run: false,
         retained_ref: None,
         tree: Some(full),
         verification: "push-succeeded".into(),
@@ -2547,10 +2586,6 @@ fn verify_repository(r: &mut Repository, remote: &str) {
         r.verification_error = Some("incomplete local inventory".into());
         return;
     }
-    if !r.lfs_files.is_empty() {
-        r.verification_error = Some("LFS payload verification is not implemented; retained".into());
-        return;
-    }
     if r.saved.is_empty() && (!r.branches.is_empty() || !r.stashes.is_empty()) {
         r.verification_error = Some("no recovery refs recorded".into());
         return;
@@ -2561,78 +2596,65 @@ fn verify_repository(r: &mut Repository, remote: &str) {
             return;
         }
     }
+    let refs = r
+        .saved
+        .iter()
+        .map(|saved| format!("refs/heads/{}", saved.remote_ref))
+        .collect::<Vec<_>>();
+    let actual = match remote_lfs::verify_remote_lfs_refs(remote, &refs) {
+        Ok(objects) => objects,
+        Err(error) => {
+            r.verification_error = Some(error);
+            return;
+        }
+    };
+    let expected = r
+        .lfs_objects
+        .iter()
+        .map(|object| (object.oid.as_str(), object.size))
+        .collect::<BTreeSet<_>>();
+    let actual = actual
+        .iter()
+        .map(|object| (object.oid.as_str(), object.size))
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        r.verification_error = Some(format!(
+            "remote LFS pointer set differs from saved local inventory (expected {}, fetched {})",
+            expected.len(),
+            actual.len()
+        ));
+        return;
+    }
     for saved in &mut r.saved {
         saved.verification = "isolated-verified".into();
     }
     r.verification = "isolated-verified".into();
 }
 
-fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
+fn cleanup_blocker(r: &Repository, _branches_only: bool) -> Option<String> {
     if temporary_recovery_fixture(Path::new(&r.path)) {
         return Some("blocked-temporary-recovery-fixture".into());
     }
     if !r.inventory_complete {
         return Some("blocked-incomplete-inventory".into());
     }
-    if branches_only {
-        if !matches!(r.preservation.as_str(), "branches-pushed" | "complete") {
-            return Some("blocked-branch-only-preservation".into());
-        }
-        if !r.inventory_errors.is_empty() {
-            return Some("blocked-inventory-errors".into());
-        }
-        if !r.alternates.is_empty() {
-            return Some("blocked-shared-storage".into());
-        }
-        if !r.lfs_files.is_empty() {
-            return Some("blocked-LFS-payloads".into());
-        }
-        if !r.stashes.is_empty()
-            || !r.unreachable_commits.is_empty()
-            || !r.unreachable_noncommits.is_empty()
-        {
-            return Some("blocked-unpreserved-local-objects".into());
-        }
-        if !r.stashes.is_empty()
-            || !r.unreachable_commits.is_empty()
-            || !r.unreachable_noncommits.is_empty()
-        {
-            return Some("blocked-unpreserved-local-objects".into());
-        }
-        if let Some(reason) = branch_only_refs_blocker(r) {
-            return Some(reason);
-        }
-    }
-    if !branches_only && r.preservation != "complete" {
+    // Branch-only preservation is a push convenience, never deletion proof.
+    // Any cleanup mode requires the full inventory and isolated verification.
+    if r.preservation != "complete" {
         return Some("blocked-preservation".into());
     }
     if r.saved.iter().any(|saved| {
-        if branches_only {
-            saved.source == "branch"
-                && !matches!(
-                    saved.verification.as_str(),
-                    "push-succeeded" | "isolated-verified"
-                )
-        } else {
-            saved.verification != "isolated-verified"
-        }
+        saved.verification != "isolated-verified"
     }) {
-        return Some("blocked-branch-push-not-successful".into());
+        return Some("blocked-isolated-verification-incomplete".into());
     }
-    if !branches_only && !r.lfs_files.is_empty() {
-        return Some("blocked-LFS-payloads".into());
-    }
-    if branches_only {
-        for worktree in &r.worktrees {
-            if let Some(reason) = branches_only_worktree_blocker(worktree, &r.branches) {
-                return Some(reason);
-            }
-        }
+    if !matches!(r.lfs_preservation.as_str(), "not-required" | "push-succeeded") {
+        return Some("blocked-LFS-preservation-incomplete".into());
     }
     for worktree in r
         .worktrees
         .iter()
-        .filter(|w| !branches_only && !w.ignored.is_empty())
+        .filter(|w| !w.ignored.is_empty())
     {
         if !r.saved.iter().any(|saved| {
             saved.source == "worktree-snapshot"
@@ -2658,6 +2680,13 @@ fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
         return Some("blocked-repository-kind".into());
     }
     for worktree in &r.worktrees {
+        if worktree.missing {
+            let path = Path::new(&worktree.path);
+            if worktree_path_is_absent(path) {
+                return Some(format!("blocked-missing-worktree:{}", worktree.path));
+            }
+            return Some(format!("blocked-worktree-state-changed:{}", worktree.path));
+        }
         if worktree.foreign_registration {
             return Some("blocked-worktree-dependency".into());
         }
@@ -2666,8 +2695,7 @@ fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
                 if ensure_no_nested_git(path).is_err() {
                     return Some("blocked-worktree-dependency".into());
                 }
-            } else if branches_only
-                && item == "<nested-repository scan skipped because ignored content blocks cleanup>"
+            } else if item == "<nested-repository scan skipped because ignored content blocks cleanup>"
             {
                 if validate_ignored_nested_inventory(worktree).is_err() {
                     return Some("blocked-worktree-dependency".into());
@@ -2682,39 +2710,68 @@ fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
             s.source == "branch"
                 && s.name == format!("branch:{}", b.name)
                 && s.commit == b.commit
-                && (if branches_only {
-                    matches!(
-                        s.verification.as_str(),
-                        "push-succeeded" | "isolated-verified"
-                    )
-                } else {
-                    s.verification == "isolated-verified"
-                })
+                && s.verification == "isolated-verified"
         }) {
             return Some(format!("blocked-unpushed-branch:{}", b.name));
         }
     }
-    if !branches_only {
-        for w in &r.worktrees {
-            if w.detached
-                && !r
-                    .branches
-                    .iter()
-                    .any(|b| Some(&b.commit) == w.head.as_ref())
-            {
-                let Some(head) = w.head.as_ref() else {
-                    return Some("blocked-detached-head-missing".into());
-                };
-                if !r.saved.iter().any(|s| {
-                    s.source == "detached"
-                        && s.name == format!("detached:{}", w.path)
-                        && &s.commit == head
-                        && s.verification == "isolated-verified"
-                }) {
-                    return Some(format!("blocked-unpushed-detached-head:{}", w.path));
-                }
+    for w in &r.worktrees {
+        if w.detached
+            && !r
+                .branches
+                .iter()
+                .any(|b| Some(&b.commit) == w.head.as_ref())
+        {
+            let Some(head) = w.head.as_ref() else {
+                return Some("blocked-detached-head-missing".into());
+            };
+            if !r.saved.iter().any(|s| {
+                s.source == "detached"
+                    && s.name == format!("detached:{}", w.path)
+                    && &s.commit == head
+                    && s.verification == "isolated-verified"
+            }) {
+                return Some(format!("blocked-unpushed-detached-head:{}", w.path));
             }
         }
+    }
+    if !r.stashes.is_empty()
+        && r.stashes.iter().any(|stash| {
+            let oid = stash.split_whitespace().next().unwrap_or_default();
+            !r.saved.iter().any(|saved| saved.source == "stash" && saved.commit == oid)
+        })
+    {
+        return Some("blocked-unpreserved-stash".into());
+    }
+    for worktree in &r.worktrees {
+        if worktree.stashes.iter().any(|stash| {
+            let oid = stash.split_whitespace().next().unwrap_or_default();
+            !r.saved.iter().any(|saved| saved.source == "stash" && saved.commit == oid)
+        }) {
+            return Some(format!("blocked-unpreserved-worktree-stash:{}", worktree.path));
+        }
+    }
+    for oid in &r.unreachable_commits {
+        if !r.saved.iter().any(|saved| {
+            git(Path::new(&r.path), &["merge-base", "--is-ancestor", oid, &saved.commit]).is_ok()
+        }) {
+            return Some(format!("blocked-unpreserved-unreachable-commit:{oid}"));
+        }
+    }
+    if !r.unreachable_noncommits.is_empty() {
+        let represented = r.saved.iter().flat_map(|saved| {
+            git(Path::new(&r.path), &["rev-list", "--objects", &saved.commit])
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+                .collect::<Vec<_>>()
+        }).collect::<BTreeSet<_>>();
+        if let Some(oid) = r.unreachable_noncommits.iter().find(|oid| !represented.contains(*oid)) {
+            return Some(format!("blocked-unpreserved-unreachable-object:{oid}"));
+        }
+    }
+    if let Some(reference) = unsupported_local_ref(r) {
+        return Some(format!("blocked-unpreserved-local-ref:{reference}"));
     }
     let mut refs = BTreeSet::new();
     if r.saved
@@ -2725,6 +2782,33 @@ fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
     }
     None
 }
+
+fn unsupported_local_ref(r: &Repository) -> Option<String> {
+    r.refs.iter().find_map(|entry| {
+        let mut fields = entry.split_whitespace();
+        let (Some(reference), Some(oid), Some(kind)) = (fields.next(), fields.next(), fields.next()) else {
+            return Some(entry.clone());
+        };
+        if reference.starts_with("refs/heads/") {
+            return None;
+        }
+        // Remote-tracking refs are cached views of the target remote. Local-only
+        // tracking tips are separately inventoried and saved by preserve().
+        if reference.starts_with("refs/remotes/") && kind == "commit"
+            && r.saved.iter().any(|saved| {
+                git(Path::new(&r.path), &["merge-base", "--is-ancestor", oid, &saved.commit]).is_ok()
+            }) {
+            return None;
+        }
+        if reference == "refs/stash" && kind == "commit"
+            && r.saved.iter().any(|saved| saved.source == "stash" && saved.commit == oid) {
+            return None;
+        }
+        // Tags, notes, replace refs, and unknown namespaces need their own
+        // preservation format; never drop them with the local repository.
+        Some(reference.to_owned())
+    })
+}
 fn preview(m: &mut Manifest, branches_only: bool) {
     let deleted = m.deleted.iter().cloned().collect::<BTreeSet<_>>();
     for r in &mut m.repositories {
@@ -2732,7 +2816,7 @@ fn preview(m: &mut Manifest, branches_only: bool) {
             r.deletion = "deleted".into();
             continue;
         }
-        r.deletion = cleanup_blocker(r, branches_only).unwrap_or_else(|| "eligible".into());
+        r.deletion = cleanup_blocker(r, false).unwrap_or_else(|| "eligible".into());
         if branches_only {
             print_branch_only_omissions(r);
         }
@@ -2782,6 +2866,7 @@ fn print_branch_only_omissions(repository: &Repository) {
         }
     }
 }
+
 fn branch_saved(r: &Repository) -> impl Iterator<Item = &Saved> {
     r.saved.iter().filter(|saved| saved.source == "branch")
 }
@@ -2799,20 +2884,15 @@ fn current_ref_inventory(path: &Path) -> Result<Vec<String>, String> {
     .collect())
 }
 
-fn branches_only_worktree_blocker(worktree: &Worktree, branches: &[Branch]) -> Option<String> {
+fn branches_only_worktree_blocker(worktree: &Worktree) -> Option<String> {
     if worktree.missing {
         return Some(format!("blocked-missing-worktree:{}", worktree.path));
     }
     if worktree.foreign_registration {
         return Some(format!("blocked-worktree-dependency:{}", worktree.path));
     }
-    if worktree.detached
-        && !worktree
-            .head
-            .as_ref()
-            .is_some_and(|head| branches.iter().any(|branch| &branch.commit == head))
-    {
-        return Some(format!("blocked-unpushed-detached-head:{}", worktree.path));
+    if worktree.detached {
+        return Some(format!("blocked-unpreserved-detached-head:{}", worktree.path));
     }
     if !worktree.stashes.is_empty()
         || worktree.status.iter().any(|line| !line.starts_with('#'))
@@ -2841,30 +2921,6 @@ fn branches_only_worktree_blocker(worktree: &Worktree, branches: &[Branch]) -> O
     None
 }
 
-fn branch_only_refs_blocker(repository: &Repository) -> Option<String> {
-    repository.refs.iter().find_map(|entry| {
-        let mut fields = entry.split_whitespace();
-        let (Some(reference), Some(oid), Some(kind)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            return Some(format!("blocked-unrecognized-local-ref:{entry}"));
-        };
-        if reference.starts_with("refs/heads/") {
-            return None;
-        }
-        let covered_remote_tracking = reference.starts_with("refs/remotes/")
-            && kind == "commit"
-            && repository.branches.iter().any(|branch| {
-                git(
-                    Path::new(&repository.path),
-                    &["merge-base", "--is-ancestor", oid, &branch.commit],
-                )
-                .is_ok()
-            });
-        (!covered_remote_tracking).then(|| format!("blocked-non-branch-local-ref:{entry}"))
-    })
-}
-
 fn worktree_path_is_absent(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
@@ -2874,14 +2930,13 @@ fn recheck_branches_only_worktree(
     common: &Path,
     expected: &Worktree,
     remote: &str,
-    branches: &[Branch],
 ) -> Result<(), String> {
     if expected.missing && worktree_path_is_absent(Path::new(&expected.path)) {
         return Ok(());
     }
     let mut current = expected.clone();
     inventory_worktree(owner, common, &mut current, remote)?;
-    if let Some(reason) = branches_only_worktree_blocker(&current, branches) {
+    if let Some(reason) = branches_only_worktree_blocker(&current) {
         return Err(reason);
     }
     if current.fingerprint != expected.fingerprint
@@ -2892,71 +2947,6 @@ fn recheck_branches_only_worktree(
         || current.nested_repositories != expected.nested_repositories
     {
         return Err(format!("worktree changed since scan: {}", expected.path));
-    }
-    Ok(())
-}
-
-fn cleanup_recheck_branches(r: &Repository, remote: &str) -> Result<(), String> {
-    let owner = Path::new(&r.path);
-    if !target_path(owner, remote) {
-        return Err("repository remote no longer matches requested target".into());
-    }
-    if branch_inventory(owner)? != r.branches {
-        return Err("local branches changed since inventory".into());
-    }
-    if current_ref_inventory(owner)? != r.refs {
-        return Err("local refs changed since inventory".into());
-    }
-    let mut current = parse_worktrees(owner)?;
-    for worktree in &mut current {
-        inventory_worktree(owner, Path::new(&r.common_dir), worktree, remote)?;
-    }
-    let mut expected = r.worktrees.clone();
-    current.sort_by(|a, b| a.path.cmp(&b.path));
-    expected.sort_by(|a, b| a.path.cmp(&b.path));
-    if current.len() != expected.len() {
-        return Err(format!(
-            "registered worktrees changed since inventory: expected {}, found {}",
-            expected.len(),
-            current.len()
-        ));
-    }
-    if let Some((now, expected)) = current.iter().zip(&expected).find(|(now, expected)| {
-        now.path != expected.path
-            || now.head != expected.head
-            || now.branch != expected.branch
-            || now.detached != expected.detached
-            || now.bare != expected.bare
-            || (now.missing != expected.missing
-                && !(expected.missing && !Path::new(&expected.path).exists()))
-    }) {
-        return Err(format!(
-            "registered worktrees changed since inventory at {} (current head {:?}, branch {:?}, missing {}; expected head {:?}, branch {:?}, missing {})",
-            now.path,
-            now.head,
-            now.branch,
-            now.missing,
-            expected.head,
-            expected.branch,
-            expected.missing
-        ));
-    }
-    for worktree in &r.worktrees {
-        recheck_branches_only_worktree(
-            owner,
-            Path::new(&r.common_dir),
-            worktree,
-            remote,
-            &r.branches,
-        )?;
-    }
-    for saved in branch_saved(r) {
-        if !saved_commit_is_preserved(remote, saved)? {
-            return Err(format!(
-                "pushed recovery ref missing or changed: {}",
-                saved.remote_ref
-            ));
-        }
     }
     Ok(())
 }
@@ -3105,26 +3095,20 @@ fn cleanup_repository(
     r: &Repository,
     remote: &str,
     state: &Path,
-    branches_only: bool,
+    _branches_only: bool,
 ) -> Result<Vec<String>, String> {
-    if let Some(reason) = cleanup_blocker(r, branches_only) {
+    if let Some(reason) = cleanup_blocker(r, false) {
         return Err(reason);
     }
-    if !branches_only {
-        for saved in &r.saved {
-            isolated_verify_saved(remote, saved)?;
-        }
+    for saved in &r.saved {
+        isolated_verify_saved(remote, saved)?;
     }
     let owner = PathBuf::from(&r.path);
     let md = fs::symlink_metadata(&owner).map_err(|e| e.to_string())?;
     if !md.is_dir() || md.file_type().is_symlink() {
         return Err("repository path is not an exact real directory".into());
     }
-    if branches_only {
-        cleanup_recheck_branches(r, remote)?;
-    } else {
-        cleanup_recheck(r, remote)?;
-    }
+    cleanup_recheck(r, remote)?;
     let owner_canon = fs::canonicalize(&owner).map_err(|e| e.to_string())?;
     let common_canon = fs::canonicalize(&r.common_dir).map_err(|e| e.to_string())?;
     if !common_canon.starts_with(&owner_canon) {
@@ -3143,12 +3127,8 @@ fn cleanup_repository(
     let mut worktrees: Vec<PathBuf> = r.worktrees.iter().map(|w| PathBuf::from(&w.path)).collect();
     worktrees.sort_by_key(|p| (p == &owner, p.clone()));
     let mut removed = Vec::new();
-    // Missing worktree paths have no working files to remove, but stale Git
-    // administrative records prevent the final owner-only check. Prune those
-    // records after confirming inventory and remote branch state above.
-    if r.worktrees.iter().any(|w| w.missing) {
-        git(&owner, &["worktree", "prune"])?;
-    }
+    // Missing registrations are blocked by cleanup_blocker. Never prune a
+    // stale worktree record as a side effect of deleting the owning clone.
     for wt in worktrees {
         if wt == owner {
             continue;
@@ -3195,16 +3175,9 @@ fn cleanup_repository(
                 wt.display()
             ));
         }
-        if branches_only {
-            if let Some(reason) = branches_only_worktree_blocker(&current, &r.branches) {
-                return Err(reason);
-            }
-        }
-        if !branches_only {
-            validate_nested_inventory(expected)?;
-            for saved in &r.saved {
-                isolated_verify_saved(remote, saved)?;
-            }
+        validate_nested_inventory(expected)?;
+        for saved in &r.saved {
+            isolated_verify_saved(remote, saved)?;
         }
         git(
             &owner,
@@ -3232,11 +3205,8 @@ fn cleanup_repository(
     }
     let root = Path::new(&root_before.path);
     if r.kind == "bare" {
-        for saved in if branches_only {
-            branch_saved(r).collect::<Vec<_>>()
-        } else {
-            r.saved.iter().collect::<Vec<_>>()
-        } {
+        for saved in &r.saved {
+            isolated_verify_saved(remote, saved)?;
             if !saved_commit_is_preserved(remote, saved)? {
                 return Err(format!(
                     "pushed ref changed immediately before deletion: {}",
@@ -3249,37 +3219,6 @@ fn cleanup_repository(
         }
         fs::remove_dir_all(&owner)
             .map_err(|e| format!("remove exact bare repository {}: {e}", owner.display()))?;
-        removed.push(owner.to_string_lossy().into_owned());
-        return Ok(removed);
-    }
-    if branches_only {
-        if branch_inventory(root)? != r.branches {
-            return Err("local branches changed immediately before deletion".into());
-        }
-        if current_ref_inventory(root)? != r.refs {
-            return Err("local refs changed immediately before deletion".into());
-        }
-        for saved in branch_saved(r) {
-            let reference = format!("refs/heads/{}", saved.remote_ref);
-            if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
-                return Err(format!(
-                    "pushed branch ref changed immediately before deletion: {}",
-                    saved.remote_ref
-                ));
-            }
-        }
-        recheck_branches_only_worktree(
-            &owner,
-            Path::new(&r.common_dir),
-            root_before,
-            remote,
-            &r.branches,
-        )?;
-        if filesystem_identity(&owner) != r.device.zip(r.inode) {
-            return Err("repository device/inode changed immediately before deletion".into());
-        }
-        fs::remove_dir_all(&owner)
-            .map_err(|e| format!("remove exact clone {}: {e}", owner.display()))?;
         removed.push(owner.to_string_lossy().into_owned());
         return Ok(removed);
     }
@@ -3340,7 +3279,10 @@ fn cleanup_repository(
     removed.push(owner.to_string_lossy().into_owned());
     Ok(removed)
 }
-fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
+fn dedupe(m: &mut Manifest, _state: &Path, execute: bool) -> Result<(), String> {
+    if execute {
+        return Err("dedupe --execute disabled: remote branch deletion is forbidden".into());
+    }
     let remote = m.remote.clone();
     reject_remote_url_rewrite(&remote, None)?;
     let branches = remote_snapshot::fetch_remote_snapshots(&remote)?;
@@ -3374,8 +3316,6 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
         .cloned()
         .collect::<BTreeSet<_>>();
     let groups = dedupe::exact_duplicate_groups(branches, &protected);
-    let mut candidates = Vec::new();
-    let mut retained_by_branch = BTreeMap::new();
     for group in &groups {
         println!(
             "commit:{}\t{}\tkeep:{}\tdelete:{}",
@@ -3394,36 +3334,12 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
             if branch.oid != group.oid || keeper.oid != group.oid {
                 return Err(format!("candidate and keeper OIDs differ for {name}"));
             }
-            retained_by_branch.insert(name.clone(), group.keeper.clone());
-            if !execute {
-                println!(
-                    "preview-delete\t{name}\tkeep\t{}\tcommit\t{}",
-                    group.keeper, group.oid
-                );
-                continue;
-            }
-            let original_ref = format!("refs/heads/{name}");
-            candidates.push(conditional_delete::Candidate {
-                remote_ref: original_ref,
-                expected_oid: branch.oid.clone(),
-                keeper_ref: format!("refs/heads/{}", group.keeper),
-                keeper_oid: keeper.oid.clone(),
-            });
+            println!(
+                "preview-delete\t{name}\tkeep\t{}\tcommit\t{}",
+                group.keeper, group.oid
+            );
         }
     }
-    if !execute || candidates.is_empty() {
-        return Ok(());
-    }
-    conditional_delete::delete_candidates_if_unchanged(&remote, &candidates)?;
-    for repository in &mut m.repositories {
-        for saved in &mut repository.saved {
-            if let Some(keeper) = retained_by_branch.get(&saved.remote_ref) {
-                saved.retained_ref = Some(format!("refs/heads/{keeper}"));
-                saved.verification = "deduplicated-exact-oid".into();
-            }
-        }
-    }
-    save(m, state)?;
     Ok(())
 }
 fn main() -> Result<(), String> {
@@ -3569,7 +3485,9 @@ fn main() -> Result<(), String> {
                         println!("{}\t{}", m.repositories[i].deletion, m.repositories[i].path);
                         continue;
                     }
-                    match cleanup_repository(&m.repositories[i], &m.remote, &state, branches_only) {
+                    // Cleanup always uses strict full-preservation behavior.
+                    // `--branches-only` affects preserve/preview output only.
+                    match cleanup_repository(&m.repositories[i], &m.remote, &state, false) {
                         Ok(paths) => {
                             m.repositories[i].deletion = "deleted".into();
                             m.deleted.extend(paths);
@@ -3652,6 +3570,24 @@ fn main() -> Result<(), String> {
 mod preservation_tests {
     use super::*;
 
+    #[test]
+    fn full_preserve_guard_rejects_target_origin_with_foreign_branch_upstream() {
+        let (_temp, _remote, local, remote_s) = fixture();
+        let foreign = local.parent().unwrap().join("foreign.git");
+        cmd(&["git", "init", "--bare", foreign.to_str().unwrap()]);
+        cmd(&[
+            "git", "-C", local.to_str().unwrap(), "remote", "add", "jackin",
+            foreign.to_str().unwrap(),
+        ]);
+        cmd(&[
+            "git", "-C", local.to_str().unwrap(), "config", "branch.main.remote", "jackin",
+        ]);
+        cmd(&[
+            "git", "-C", local.to_str().unwrap(), "config", "branch.main.merge", "refs/heads/main",
+        ]);
+        assert_eq!(branch_upstreams_target_remote(&local, &remote_s).unwrap(), false);
+    }
+
     fn cmd(args: &[&str]) -> String {
         let o = Command::new(args[0])
             .args(&args[1..])
@@ -3728,6 +3664,47 @@ mod preservation_tests {
             "show",
             &format!("{oid}:{path}"),
         ])
+    }
+
+    #[test]
+    fn recovery_push_rejects_existing_ref_without_advancing_it() {
+        let (_temp, local, remote, remote_s) = fixture();
+        let before = cmd(&[
+            "git",
+            "--git-dir",
+            remote.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ]);
+        fs::write(local.join("second.txt"), "second\n").unwrap();
+        cmd(&["git", "-C", local.to_str().unwrap(), "add", "second.txt"]);
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "commit",
+            "-m",
+            "second",
+        ]);
+        let new_oid = cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "rev-parse",
+            "HEAD",
+        ]);
+        let error = push_ref(&remote_s, &local, &new_oid, "refs/heads/main").unwrap_err();
+        assert!(error.contains("remote ref collision"));
+        assert_eq!(
+            cmd(&[
+                "git",
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ]),
+            before
+        );
     }
 
     #[test]
@@ -4472,7 +4449,7 @@ mod dedupe_integration_tests {
     }
 
     #[test]
-    fn dedupe_removes_only_owned_exact_oid_aliases() {
+    fn dedupe_execute_is_disabled_without_mutating_remote() {
         let temp = tempfile::tempdir().unwrap();
         let remote = temp.path().join("remote.git");
         let local = temp.path().join("local");
@@ -4649,18 +4626,19 @@ mod dedupe_integration_tests {
         let state = temp.path().join("state");
         fs::create_dir_all(&state).unwrap();
 
-        assert!(dedupe(&mut manifest, &state, true).is_ok());
+        let error = dedupe(&mut manifest, &state, true).unwrap_err();
+        assert!(error.contains("remote branch deletion is forbidden"));
 
         assert_eq!(
             remote_oid(&remote_s, "refs/heads/main").unwrap().as_deref(),
             Some(oid.as_str())
         );
-        for branch in [refs[0], refs[1]] {
+        for branch in refs {
             assert_eq!(
                 remote_oid(&remote_s, &format!("refs/heads/{branch}"))
                     .unwrap()
                     .as_deref(),
-                None
+                Some(oid.as_str())
             );
         }
         for (branch, expected) in [
@@ -4686,7 +4664,7 @@ mod dedupe_integration_tests {
                 )
                 .unwrap(),
                 None,
-                "exact commit keeper makes an archive unnecessary"
+                "dedupe execute must not create archive refs"
             );
         }
     }
