@@ -107,6 +107,8 @@ struct Repository {
     unreachable_noncommits: Vec<String>,
     alternates: Vec<String>,
     lfs_files: Vec<String>,
+    #[serde(default)]
+    lfs_preservation: String,
     inventory_complete: bool,
     inventory_errors: Vec<String>,
     saved: Vec<Saved>,
@@ -634,25 +636,35 @@ fn enumerate_unreachable(
 
 fn reachable_objects(repo: &Path, worktrees: &[Worktree]) -> Result<BTreeSet<String>, String> {
     let refs = git(repo, &["for-each-ref", "--format=%(refname)"])?;
+    // Walk the union once. Per-ref walks repeat shared history for every
+    // branch and make large multi-worktree clones impractical.
+    let mut roots = refs.lines().map(str::to_owned).collect::<Vec<_>>();
+    for worktree in worktrees {
+        if let Some(head) = worktree.head.as_deref() {
+            roots.push(head.to_owned());
+        }
+    }
+    roots.sort();
+    roots.dedup();
     let mut reachable = BTreeSet::new();
-    for reference in refs.lines() {
-        let Ok(tip) = git(repo, &["rev-parse", &format!("{reference}^{{commit}}")]) else {
-            continue;
-        };
-        let rows = git(repo, &["rev-list", "--objects", tip.trim()])?;
+    if !roots.is_empty() {
+        let mut command = vec![
+            "git".to_owned(),
+            "-C".into(),
+            repo.to_string_lossy().into_owned(),
+            "-c".into(),
+            format!("safe.directory={}", repo.to_string_lossy()),
+            "rev-list".into(),
+            "--objects".into(),
+        ];
+        command.extend(roots);
+        let rows = out(&command, None, &[("GIT_NO_LAZY_FETCH", "1")])?;
         reachable.extend(
             rows.lines()
                 .filter_map(|line| line.split_whitespace().next().map(str::to_owned)),
         );
     }
     for worktree in worktrees {
-        if let Some(head) = worktree.head.as_deref() {
-            let rows = git(repo, &["rev-list", "--objects", head])?;
-            reachable.extend(
-                rows.lines()
-                    .filter_map(|line| line.split_whitespace().next().map(str::to_owned)),
-            );
-        }
         for tree in [&worktree.index_tree].into_iter().flatten() {
             let root_tree = git(repo, &["rev-parse", &format!("{tree}^{{tree}}")])?
                 .trim()
@@ -1088,6 +1100,109 @@ fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Scan every LFS payload referenced by the repository's refs before allowing
+/// Git's enabled LFS pre-push hook to upload branch objects. Gzip payloads are
+/// expanded to a private temporary directory so their contents are inspected.
+fn scan_lfs_payloads(repo: &Path, records: &[String]) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let env = out(
+        &[
+            "git".into(),
+            "-C".into(),
+            repo.to_string_lossy().into_owned(),
+            "lfs".into(),
+            "env".into(),
+        ],
+        None,
+        &[],
+    )?;
+    let media = env
+        .lines()
+        .find_map(|line| line.strip_prefix("LocalMediaDir="))
+        .map(PathBuf::from)
+        .ok_or("Git LFS did not report LocalMediaDir")?;
+    let temporary = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let mut seen = BTreeSet::new();
+    for record in records {
+        let Some((oid, rest)) = record.split_once(' ') else {
+            return Err("malformed Git LFS inventory entry".into());
+        };
+        if oid.len() != 64 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("unsupported Git LFS object ID".into());
+        }
+        if !seen.insert(oid.to_owned()) {
+            continue;
+        }
+        let payload = media.join(&oid[..2]).join(&oid[2..4]).join(oid);
+        if !payload.is_file() {
+            return Err(format!("Git LFS payload missing locally: {oid}"));
+        }
+        let filename = rest
+            .trim_start_matches(['*', '-', ' '])
+            .trim()
+            .rsplit('/')
+            .next()
+            .unwrap_or("payload");
+        let bytes = fs::read(&payload).map_err(|e| e.to_string())?;
+        let scan_path = if bytes.starts_with(&[0x1f, 0x8b]) {
+            let expanded = temporary.path().join(format!("{oid}-{}", filename.trim_end_matches(".gz")));
+            let status = Command::new("gzip")
+                .args(["-dc", payload.to_string_lossy().as_ref()])
+                .output()
+                .map_err(|e| format!("cannot decompress LFS payload: {e}"))?;
+            if !status.status.success() {
+                return Err(format!("cannot decompress Git LFS payload: {oid}"));
+            }
+            fs::write(&expanded, status.stdout).map_err(|e| e.to_string())?;
+            expanded
+        } else {
+            payload
+        };
+        let scan = vec![
+            "gitleaks".into(),
+            "dir".into(),
+            "--redact".into(),
+            "--no-banner".into(),
+            scan_path.to_string_lossy().into_owned(),
+        ];
+        if out(&scan, None, &[]).is_err() {
+            return Err(format!("secret scan blocked Git LFS payload: {oid}"));
+        }
+    }
+    Ok(())
+}
+
+fn push_lfs_payloads(repo: &Path, remote: &str, records: &[String]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for record in records {
+        let oid = record
+            .split_whitespace()
+            .next()
+            .ok_or("malformed Git LFS inventory entry")?;
+        if !seen.insert(oid.to_owned()) {
+            continue;
+        }
+        out(
+            &[
+                "git".into(),
+                "-C".into(),
+                repo.to_string_lossy().into_owned(),
+                "lfs".into(),
+                "push".into(),
+                "--object-id".into(),
+                remote.into(),
+                oid.into(),
+            ],
+            None,
+            &[],
+        )
+        .map_err(|error| format!("Git LFS object push failed ({oid}): {error}"))?;
+    }
+    Ok(())
+}
 fn remote_oid(remote: &str, reference: &str) -> Result<Option<String>, String> {
     let a = vec![
         "git".into(),
@@ -1177,9 +1292,19 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             continue;
         }
         if !r.lfs_files.is_empty() {
-            r.verification_error =
-                Some("LFS payloads are not scanned or transferred by this workflow".into());
-            continue;
+            if let Err(error) = scan_lfs_payloads(&path, &r.lfs_files) {
+                r.lfs_preservation = "blocked".into();
+                r.verification_error = Some(error);
+                continue;
+            }
+            if let Err(error) = push_lfs_payloads(&path, &m.remote, &r.lfs_files) {
+                r.lfs_preservation = "blocked".into();
+                r.verification_error = Some(error);
+                continue;
+            }
+            r.lfs_preservation = "push-succeeded".into();
+        } else {
+            r.lfs_preservation = "not-required".into();
         }
         if r.worktrees.iter().any(|w| w.foreign_registration) {
             r.verification_error = Some("missing or foreign registered worktree".into());
@@ -1597,7 +1722,7 @@ fn cleanup_blocker(r: &Repository) -> Option<String> {
     {
         return Some("blocked-push-not-successful".into());
     }
-    if !r.lfs_files.is_empty() {
+    if !r.lfs_files.is_empty() && r.lfs_preservation != "push-succeeded" {
         return Some("blocked-LFS-payloads".into());
     }
     for worktree in r.worktrees.iter().filter(|w| !w.ignored.is_empty()) {
