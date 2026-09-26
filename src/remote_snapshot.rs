@@ -25,6 +25,7 @@ pub struct RemoteHistorySnapshot {
 ///
 /// Any remote movement during the fetch, malformed ref output, missing commit
 /// or tree object, or Git failure aborts the snapshot.
+#[cfg(test)]
 pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, String> {
     Ok(fetch_remote_history(remote)?.branches)
 }
@@ -176,6 +177,7 @@ fn parse_parent_graph(bytes: &[u8]) -> Result<BTreeMap<String, BTreeSet<String>>
 
 /// Read the advertised default branch. If the remote omits symbolic HEAD,
 /// return `None`; malformed or failed advertisements are errors.
+#[cfg(test)]
 pub fn default_branch(remote: &str) -> Result<Option<String>, String> {
     let mut command = Command::new("git");
     command.args([

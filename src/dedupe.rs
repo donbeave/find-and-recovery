@@ -64,62 +64,6 @@ pub struct DedupePlan {
     pub deletions: Vec<PlannedDeletion>,
 }
 
-/// Compatibility shape for the exact-alias-only preview path.
-///
-/// New planning code must use [`plan_dedupe`] so ancestry containment is
-/// handled by one global retention pass.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExactDuplicateGroup {
-    pub oid: String,
-    pub branches: Vec<String>,
-    pub keeper: String,
-    pub delete_candidates: Vec<String>,
-}
-
-/// Group exact commit aliases for callers that only need an alias summary.
-///
-/// This does not prove history containment and must not be the final planner
-/// for remote deletion.
-pub fn exact_duplicate_groups(
-    branches: impl IntoIterator<Item = BranchSnapshot>,
-    protected: &BTreeSet<String>,
-) -> Vec<ExactDuplicateGroup> {
-    let mut by_oid = BTreeMap::<String, BTreeSet<String>>::new();
-    for branch in branches {
-        by_oid.entry(branch.oid).or_default().insert(branch.name);
-    }
-    by_oid
-        .into_iter()
-        .filter_map(|(oid, names)| {
-            if names.len() < 2 {
-                return None;
-            }
-            let keeper = names
-                .iter()
-                .find(|name| {
-                    protected.contains(*name) || matches!(name.as_str(), "main" | "master")
-                })
-                .or_else(|| names.iter().next())?
-                .clone();
-            let delete_candidates = names
-                .iter()
-                .filter(|name| {
-                    **name != keeper
-                        && !protected.contains(*name)
-                        && !matches!(name.as_str(), "main" | "master")
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            Some(ExactDuplicateGroup {
-                oid,
-                branches: names.into_iter().collect(),
-                keeper,
-                delete_candidates,
-            })
-        })
-        .collect()
-}
-
 /// Plan branch deduplication against a complete commit-parent graph.
 ///
 /// `commit_parents` maps each known commit OID to its actual parent OIDs. Root
