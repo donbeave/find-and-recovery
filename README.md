@@ -1,20 +1,16 @@
 # find-and-recovery
 
-Reusable Rust CLI for discovering local Git copies by repository URL and recording preservation evidence.
-
-## Commands
+Reusable Rust CLI for finding local Git copies by configured repository URL, preserving local branches and worktree snapshots on new recovery refs, and removing only a clone whose recorded pushes succeeded. Git hooks remain enabled on every push so Git LFS pre-push hooks upload payloads.
 
 ```sh
 cargo run -- --remote https://github.com/OWNER/REPOSITORY scan --roots /Users,/Volumes,/tmp,/private/tmp
 cargo run -- --remote https://github.com/OWNER/REPOSITORY preserve
-cargo run -- --remote https://github.com/OWNER/REPOSITORY verify
 cargo run -- --remote https://github.com/OWNER/REPOSITORY preview
+cargo run -- --remote https://github.com/OWNER/REPOSITORY cleanup --execute
 ```
 
-State defaults to `~/.local/share/find-and-recovery`; pass `--state PATH` to isolate projects. Scan roots are explicit and coverage gaps are recorded in `manifest.json`. Review the manifest after each phase.
+State defaults to `~/.local/share/find-and-recovery`; use `--state PATH` to isolate projects. `scan` records inaccessible paths and coverage gaps in `manifest.json`. Branches named `main`, `master`, or the remote default map only to new recovery refs. Existing remote refs are never overwritten; a collision blocks that item. Gitleaks checks local-only commits and working files before upload.
 
-Preservation refuses repositories with unsupported dependencies or content. Verification fetches saved refs into a separate bare Git repository and compares commit and tree IDs. Do not treat a successful push as proof of preservation.
+Cleanup requires complete inventory and a successful push record for each local branch. It blocks ignored files, nested repositories, shared object stores, and unsafe dependencies. It rechecks local refs/worktrees immediately before removal, removes linked worktrees first, then removes the exact clone path. Cleanup never calls remote deletion.
 
-Cleanup execution is deliberately disabled. Exact filesystem, ignored-file, LFS payload, and dependency proofs are not complete. Keep every source copy until those gates exist and independent verification passes. Never remove the state directory: it contains the audit manifest.
-
-Run the disposable fixture suite with `cargo test` before using changes.
+Run the disposable fixture suite with `cargo test` before use.

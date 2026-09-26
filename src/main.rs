@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 #[derive(Parser)]
 #[command(
     name = "find-and-recovery",
-    about = "Inventory, preserve, verify, and clean local Git copies safely"
+    about = "Find matching Git copies, push branches to recovery refs, and clean pushed copies"
 )]
 struct Cli {
     #[arg(long)]
@@ -32,7 +32,6 @@ enum Phase {
         roots: Vec<PathBuf>,
     },
     Preserve,
-    Verify,
     Preview,
     Cleanup {
         #[arg(long)]
@@ -586,9 +585,28 @@ fn sensitive_re(repo: &Path) -> Regex {
     let _ = repo;
     Regex::new(r#"(?i)(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|\b(password|secret|api[_-]?key|access[_-]?token|token|client[_-]?secret)\s*[:=]\s*['\"]?[A-Za-z0-9/+_=-]{8,})"#).unwrap()
 }
-fn scan_commit(repo: &Path, oid: &str) -> Result<(), String> {
+fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
     // Run the maintained scanner against the exact commit ancestry before any
     // object upload. Never persist scanner output or print a finding.
+    let remote_refs = if remote.is_empty() {
+        String::new()
+    } else {
+        out(
+            &["git".into(), "ls-remote".into(), remote.into()],
+            None,
+            &[],
+        )
+        .map_err(|e| format!("cannot inspect remote history for secret scanning: {e}"))?
+    };
+    let excluded = remote_refs
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect::<BTreeSet<_>>();
+    let mut range = oid.to_owned();
+    if !excluded.is_empty() {
+        range.push_str(" --not ");
+        range.push_str(&excluded.iter().copied().collect::<Vec<_>>().join(" "));
+    }
     let report = env::temp_dir().join(format!(
         "far-gitleaks-{}-{}.json",
         std::process::id(),
@@ -600,7 +618,7 @@ fn scan_commit(repo: &Path, oid: &str) -> Result<(), String> {
         "--no-banner".into(),
         "--redact".into(),
         "--log-opts".into(),
-        oid.into(),
+        range.clone(),
         "--report-format".into(),
         "json".into(),
         "--report-path".into(),
@@ -613,29 +631,39 @@ fn scan_commit(repo: &Path, oid: &str) -> Result<(), String> {
     if scan_result.is_err() {
         return Err("gitleaks failed or found a secret; upload blocked".into());
     }
-    if serde_json::from_slice::<serde_json::Value>(&findings)
+    let finding_count = serde_json::from_slice::<serde_json::Value>(&findings)
         .ok()
         .and_then(|v| v.as_array().map(|a| a.len()))
-        .unwrap_or(usize::MAX)
-        != 0
-    {
-        return Err("gitleaks findings detected; upload blocked".into());
+        .unwrap_or(usize::MAX);
+    if finding_count != 0 {
+        return Err(format!(
+            "gitleaks findings detected ({finding_count}); upload blocked"
+        ));
     }
     let r = sensitive_re(repo);
-    let ids = git(repo, &["rev-list", "--objects", oid])?;
+    let mut rev_args = vec![
+        "rev-list".to_owned(),
+        "--objects".to_owned(),
+        oid.to_owned(),
+    ];
+    if !excluded.is_empty() {
+        rev_args.push("--not".into());
+        rev_args.extend(excluded.iter().map(|x| (*x).to_owned()));
+    }
+    let ids = {
+        let mut args = vec![
+            "git".to_owned(),
+            "-C".into(),
+            repo.to_string_lossy().into_owned(),
+        ];
+        args.extend(rev_args);
+        out(&args, None, &[])?
+    };
     let input = ids
         .lines()
         .filter_map(|x| x.split_whitespace().next())
         .collect::<Vec<_>>()
         .join("\n");
-    let a = vec![
-        "git".into(),
-        "-C".into(),
-        repo.to_string_lossy().into_owned(),
-        "cat-file".into(),
-        "--batch".into(),
-    ];
-    let o = run(&a, None, &[("GIT_NO_LAZY_FETCH", "1")]);
     let mut child = Command::new("git")
         .args(["-C", repo.to_string_lossy().as_ref(), "cat-file", "--batch"])
         .env("GIT_NO_LAZY_FETCH", "1")
@@ -686,7 +714,6 @@ fn scan_commit(repo: &Path, oid: &str) -> Result<(), String> {
         }
         pos += size + 1;
     }
-    let _ = o;
     Ok(())
 }
 fn secret_scan(repo: &Path, worktrees: &[Worktree], remote: &str) -> Result<(), String> {
@@ -782,8 +809,6 @@ fn push_ref(remote: &str, repo: &Path, oid: &str, reference: &str) -> Result<(),
         "git".into(),
         "-C".into(),
         repo.to_string_lossy().into_owned(),
-        "-c".into(),
-        "core.hooksPath=/dev/null".into(),
         "push".into(),
         remote.into(),
         format!("{oid}:{reference}"),
@@ -815,13 +840,6 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         let p = PathBuf::from(&r.path);
         if r.kind == "bare" {
             r.verification_error = Some("bare stores require tag/ref metadata preservation".into());
-            continue;
-        }
-        if !r.lfs_files.is_empty() {
-            r.verification_error = Some(
-                "LFS payload transfer and independent payload verification are not implemented"
-                    .into(),
-            );
             continue;
         }
         if r.worktrees.iter().any(|w| {
@@ -993,7 +1011,7 @@ fn save_object(
     oid: &str,
     kind: &str,
 ) -> Result<(), String> {
-    scan_commit(repo, oid)?;
+    scan_commit(repo, oid, remote)?;
     let rr = recovery_ref(
         &Repository {
             common_dir: common.into(),
@@ -1011,7 +1029,7 @@ fn save_object(
         commit: oid.into(),
         remote_ref: rr,
         tree: None,
-        verification: "pushed-unverified".into(),
+        verification: "push-succeeded".into(),
     });
     Ok(())
 }
@@ -1117,7 +1135,7 @@ fn save_worktree(
             (!head.is_empty()).then_some(head),
             "recovery staged snapshot",
         )?;
-        scan_commit(p, &c)?;
+        scan_commit(p, &c, remote)?;
         let rr = recovery_ref(
             &Repository {
                 common_dir: common.into(),
@@ -1134,12 +1152,12 @@ fn save_worktree(
             commit: c.clone(),
             remote_ref: rr,
             tree: Some(staged.trim().into()),
-            verification: "pushed-unverified".into(),
+            verification: "push-succeeded".into(),
         });
         // Keep owned parent string alive through complete snapshot creation.
         let work =
             create_snapshot_commit(p, &full_tree, Some(&c), "recovery full worktree snapshot")?;
-        scan_commit(p, &work)?;
+        scan_commit(p, &work, remote)?;
         let rr = recovery_ref(
             &Repository {
                 common_dir: common.into(),
@@ -1156,7 +1174,7 @@ fn save_worktree(
             commit: work,
             remote_ref: rr,
             tree: Some(full_tree),
-            verification: "pushed-unverified".into(),
+            verification: "push-succeeded".into(),
         });
     } else {
         let work = create_snapshot_commit(
@@ -1165,7 +1183,7 @@ fn save_worktree(
             (!head.is_empty()).then_some(head),
             "recovery full worktree snapshot",
         )?;
-        scan_commit(p, &work)?;
+        scan_commit(p, &work, remote)?;
         let rr = recovery_ref(
             &Repository {
                 common_dir: common.into(),
@@ -1182,95 +1200,164 @@ fn save_worktree(
             commit: work,
             remote_ref: rr,
             tree: Some(full_tree),
-            verification: "pushed-unverified".into(),
+            verification: "push-succeeded".into(),
         });
     }
     Ok(())
 }
 
-fn verify(m: &mut Manifest, state: &Path) -> Result<(), String> {
-    for r in &mut m.repositories {
-        if r.saved.is_empty() {
-            continue;
-        }
-        let p = PathBuf::from(&r.path);
-        let fresh = state.join(format!("verify-{}-{}", hash_name(&r.path), now()));
-        fs::create_dir_all(&fresh).map_err(|e| e.to_string())?;
-        let a = vec![
-            "git".into(),
-            "init".into(),
-            "--bare".into(),
-            fresh.to_string_lossy().into_owned(),
-        ];
-        out(&a, None, &[])?;
-        let mut good = true;
-        for s in &mut r.saved {
-            let src = format!("refs/heads/{}", s.remote_ref);
-            let dst = format!("refs/verify/{}", hash_name(&src));
-            let oid = remote_oid(&m.remote, &src)?;
-            if oid.as_deref() != Some(&s.commit) {
-                s.verification = "blocked-missing-or-mismatch".into();
-                good = false;
-                continue;
-            }
-            let a = vec![
-                "git".into(),
-                "--git-dir".into(),
-                fresh.to_string_lossy().into_owned(),
-                "fetch".into(),
-                "--no-tags".into(),
-                m.remote.clone(),
-                format!("+{src}:{dst}"),
-            ];
-            if let Err(e) = out(&a, None, &[]) {
-                s.verification = format!("blocked:{e}");
-                good = false;
-                continue;
-            }
-            let get = |rev: &str| -> Result<String, String> {
-                let a = vec![
-                    "git".into(),
-                    "--git-dir".into(),
-                    fresh.to_string_lossy().into_owned(),
-                    "rev-parse".into(),
-                    rev.into(),
-                ];
-                Ok(out(&a, None, &[])?.trim().into())
-            };
-            if get(&dst)? != s.commit {
-                good = false;
-                s.verification = "blocked-commit-mismatch".into();
-                continue;
-            }
-            let tree = get(&format!("{}^{{tree}}", s.commit))?;
-            let local = git(&p, &["rev-parse", &format!("{}^{{tree}}", s.commit)])?;
-            if tree != local.trim() {
-                good = false;
-                s.verification = "blocked-tree-mismatch".into();
-                continue;
-            }
-            s.verification = "verified".into();
-            s.tree = Some(tree);
-        }
-        if good
-            && r.inventory_complete
-            && r.worktrees
-                .iter()
-                .all(|w| !w.foreign_registration && w.nested_repositories.is_empty())
-            && r.unreachable_noncommits.is_empty()
-        {
-            r.verification = "verified".into()
-        } else {
-            r.verification = "blocked".into()
+fn same_inventory(expected: &Repository, current: &Repository) -> bool {
+    let original_unreachable: BTreeSet<_> = expected.unreachable_commits.iter().collect();
+    let saved_commits: BTreeSet<_> = expected.saved.iter().map(|s| &s.commit).collect();
+    let current_unreachable: BTreeSet<_> = current.unreachable_commits.iter().collect();
+    let added_unreachable: BTreeSet<_> = current_unreachable
+        .difference(&original_unreachable)
+        .copied()
+        .collect();
+    expected.inventory_complete
+        && current.inventory_complete
+        && expected.path == current.path
+        && expected.common_dir == current.common_dir
+        && expected.kind == current.kind
+        && expected.branches == current.branches
+        && expected.refs == current.refs
+        && expected.stashes == current.stashes
+        && added_unreachable
+            .iter()
+            .all(|oid| saved_commits.contains(*oid))
+        && original_unreachable.is_subset(&current_unreachable)
+        && expected.unreachable_noncommits == current.unreachable_noncommits
+        && expected.alternates == current.alternates
+        && expected.worktrees.len() == current.worktrees.len()
+        && expected
+            .worktrees
+            .iter()
+            .zip(&current.worktrees)
+            .all(|(a, b)| {
+                a.path == b.path
+                    && a.head == b.head
+                    && a.branch == b.branch
+                    && a.missing == b.missing
+                    && a.foreign_registration == b.foreign_registration
+                    && a.fingerprint == b.fingerprint
+            })
+}
+fn cleanup_blocker(r: &Repository) -> Option<String> {
+    if !r.inventory_complete {
+        return Some("blocked-incomplete-inventory".into());
+    }
+    if r.preservation != "complete" {
+        return Some("blocked-preservation".into());
+    }
+    if r.saved.is_empty() || r.saved.iter().any(|s| s.verification != "push-succeeded") {
+        return Some("blocked-no-successful-push-record".into());
+    }
+    if !r.alternates.is_empty() {
+        return Some("blocked-shared-storage".into());
+    }
+    if r.kind != "clone" {
+        return Some("blocked-repository-kind".into());
+    }
+    if r.worktrees.iter().any(|w| {
+        w.missing
+            || w.foreign_registration
+            || !w.ignored.is_empty()
+            || !w.nested_repositories.is_empty()
+    }) {
+        return Some("blocked-worktree-dependency-or-unpreserved-files".into());
+    }
+    for b in &r.branches {
+        if !r.saved.iter().any(|s| {
+            s.source == "branch"
+                && s.name == format!("branch:{}", b.name)
+                && s.commit == b.commit
+                && s.verification == "push-succeeded"
+        }) {
+            return Some(format!("blocked-unpushed-branch:{}", b.name));
         }
     }
-    Ok(())
+    let mut refs = BTreeSet::new();
+    if r.saved
+        .iter()
+        .any(|s| !s.remote_ref.starts_with("recovery/") || !refs.insert(&s.remote_ref))
+    {
+        return Some("blocked-recovery-ref-collision".into());
+    }
+    None
 }
 fn preview(m: &mut Manifest) {
     for r in &mut m.repositories {
-        // Commit fetch verification alone omits exact filesystem and LFS payload proofs.
-        r.deletion = "blocked".into();
+        r.deletion = cleanup_blocker(r).unwrap_or_else(|| "eligible".into());
     }
+}
+fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<String>, String> {
+    if let Some(reason) = cleanup_blocker(r) {
+        return Err(reason);
+    }
+    let owner = PathBuf::from(&r.path);
+    let md = fs::symlink_metadata(&owner).map_err(|e| e.to_string())?;
+    if !md.is_dir() || md.file_type().is_symlink() {
+        return Err("repository path is not an exact real directory".into());
+    }
+    let live = inventory_one(&owner, r.matched_paths.clone(), remote);
+    if !same_inventory(r, &live) {
+        return Err("local refs/worktrees changed since push".into());
+    }
+    let owner_canon = fs::canonicalize(&owner).map_err(|e| e.to_string())?;
+    if owner_canon == Path::new("/")
+        || owner_canon == Path::new("/Users/donbeave")
+        || owner_canon.starts_with(state)
+        || state.starts_with(&owner_canon)
+    {
+        return Err("unsafe repository/state path relationship".into());
+    }
+    let mut worktrees: Vec<PathBuf> = r.worktrees.iter().map(|w| PathBuf::from(&w.path)).collect();
+    worktrees.sort_by_key(|p| (p == &owner, p.clone()));
+    let mut removed = Vec::new();
+    for wt in worktrees {
+        if wt == owner {
+            continue;
+        }
+        let canon = fs::canonicalize(&wt).map_err(|e| e.to_string())?;
+        if canon == owner_canon {
+            continue;
+        }
+        if !canon.is_absolute() {
+            return Err("unsafe linked worktree path".into());
+        }
+        git(
+            &owner,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                wt.to_str().ok_or("non-UTF8 worktree path")?,
+            ],
+        )?;
+        removed.push(wt.to_string_lossy().into_owned());
+    }
+    let current = inventory_one(&owner, r.matched_paths.clone(), remote);
+    let root_before = r
+        .worktrees
+        .iter()
+        .find(|w| fs::canonicalize(&w.path).ok().as_deref() == Some(owner_canon.as_path()))
+        .ok_or("owner root worktree missing from inventory")?;
+    if !current.inventory_complete
+        || current.path != r.path
+        || current.common_dir != r.common_dir
+        || current.branches != r.branches
+        || current.refs != r.refs
+        || current.stashes != r.stashes
+        || current.worktrees.len() != 1
+        || current.worktrees[0].path != root_before.path
+        || current.worktrees[0].fingerprint != root_before.fingerprint
+    {
+        return Err("repository changed while removing worktrees".into());
+    }
+    fs::remove_dir_all(&owner)
+        .map_err(|e| format!("remove exact clone {}: {e}", owner.display()))?;
+    removed.push(owner.to_string_lossy().into_owned());
+    Ok(removed)
 }
 fn main() -> Result<(), String> {
     let cli = Cli::parse();
@@ -1296,6 +1383,7 @@ fn main() -> Result<(), String> {
                     "/private".into(),
                     "/opt".into(),
                     "/tmp".into(),
+                    "/private/tmp".into(),
                     "/Applications".into(),
                 ]
             } else {
@@ -1317,11 +1405,6 @@ fn main() -> Result<(), String> {
             save(&m, &state)?;
             println!("preservation recorded; inspect manifest")
         }
-        Phase::Verify => {
-            verify(&mut m, &state)?;
-            save(&m, &state)?;
-            println!("verification recorded; inspect manifest")
-        }
         Phase::Preview => {
             preview(&mut m);
             save(&m, &state)?;
@@ -1338,10 +1421,26 @@ fn main() -> Result<(), String> {
                     }
                 }
             } else {
-                return Err(
-                    "cleanup disabled until complete snapshot and LFS verification are implemented"
-                        .into(),
-                );
+                // Process serially. Each exact candidate is re-inventoried immediately
+                // before removing linked worktrees, then its owning clone.
+                for i in 0..m.repositories.len() {
+                    if m.repositories[i].deletion != "eligible" {
+                        println!("{}\t{}", m.repositories[i].deletion, m.repositories[i].path);
+                        continue;
+                    }
+                    match cleanup_repository(&m.repositories[i], &m.remote, &state) {
+                        Ok(paths) => {
+                            m.repositories[i].deletion = "deleted".into();
+                            m.deleted.extend(paths);
+                        }
+                        Err(e) => {
+                            m.repositories[i].deletion = format!("blocked:{e}");
+                            println!("{}\t{}", m.repositories[i].deletion, m.repositories[i].path);
+                        }
+                    }
+                    save(&m, &state)?;
+                }
+                println!("cleanup recorded; inspect manifest");
             }
         }
     }
@@ -1484,6 +1583,54 @@ mod preservation_tests {
     }
 
     #[test]
+    fn pushes_local_main_to_recovery_ref_then_deletes_only_fixture_clone() {
+        let (_t, local, remote, remote_s) = fixture();
+        let original_main = cmd(&[
+            "git",
+            "--git-dir",
+            remote.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ]);
+        let mut m = manifest(&local, &remote_s);
+        preserve(&mut m).unwrap();
+        assert_eq!(m.repositories[0].preservation, "complete");
+        let pushed = m.repositories[0]
+            .saved
+            .iter()
+            .find(|s| s.name == "branch:main")
+            .unwrap();
+        assert_eq!(pushed.verification, "push-succeeded");
+        assert!(pushed.remote_ref.starts_with("recovery/"));
+        assert_eq!(
+            cmd(&[
+                "git",
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main"
+            ]),
+            original_main,
+            "remote main must remain unchanged"
+        );
+        let remote_oid = cmd(&[
+            "git",
+            "--git-dir",
+            remote.to_str().unwrap(),
+            "rev-parse",
+            &format!("refs/heads/{}", pushed.remote_ref),
+        ]);
+        assert_eq!(remote_oid, pushed.commit);
+        preview(&mut m);
+        assert_eq!(m.repositories[0].deletion, "eligible");
+        let state = local.parent().unwrap().join("external-state");
+        fs::create_dir_all(&state).unwrap();
+        let removed = cleanup_repository(&m.repositories[0], &remote_s, &state).unwrap();
+        assert_eq!(removed, vec![local.to_string_lossy().into_owned()]);
+        assert!(!local.exists());
+    }
+
+    #[test]
     fn gitleaks_finding_blocks_all_uploads() {
         let (_t, local, remote, remote_s) = fixture();
         fs::write(
@@ -1582,6 +1729,49 @@ mod preservation_tests {
             ""
         );
     }
+
+    #[test]
+    fn deletes_only_after_all_branch_and_worktree_snapshots_push() {
+        let (_t, local, _remote, remote_s) = fixture();
+        let linked = local.parent().unwrap().join("linked-feature");
+        cmd(&[
+            "git",
+            "-C",
+            local.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            linked.to_str().unwrap(),
+        ]);
+        fs::write(linked.join("tracked.txt"), "feature working content\n").unwrap();
+        let mut m = manifest(&local, &remote_s);
+        preserve(&mut m).unwrap();
+        assert_eq!(m.repositories[0].preservation, "complete");
+        preview(&mut m);
+        assert_eq!(m.repositories[0].deletion, "eligible");
+        let state = local.parent().unwrap().join("external-state");
+        fs::create_dir_all(&state).unwrap();
+        let linked_canon = fs::canonicalize(&linked).unwrap();
+        let removed = cleanup_repository(&m.repositories[0], &remote_s, &state).unwrap();
+        assert!(removed.iter().any(|p| Path::new(p) == linked_canon));
+        assert!(!linked.exists(), "linked worktree still exists");
+        assert!(removed.iter().any(|p| p == local.to_str().unwrap()));
+        assert!(!local.exists());
+        assert!(!linked.exists());
+    }
+
+    #[test]
+    fn cleanup_refuses_changed_worktree_after_push() {
+        let (_t, local, _remote, remote_s) = fixture();
+        let mut m = manifest(&local, &remote_s);
+        preserve(&mut m).unwrap();
+        preview(&mut m);
+        fs::write(local.join("tracked.txt"), "late edit\n").unwrap();
+        let state = local.parent().unwrap().join("external-state");
+        assert!(cleanup_repository(&m.repositories[0], &remote_s, &state).is_err());
+        assert!(local.exists());
+    }
 }
 
 #[cfg(test)]
@@ -1638,7 +1828,7 @@ mod tests {
     fn secret_scan_accepts_safe_commit() {
         let d = repo();
         let oid = commit(d.path(), b"ordinary source\n");
-        scan_commit(d.path(), &oid).unwrap();
+        scan_commit(d.path(), &oid, "").unwrap();
     }
     #[test]
     fn secret_scan_blocks_canary_commit() {
@@ -1647,6 +1837,6 @@ mod tests {
             d.path(),
             b"github_token=ghp_abcdefghijklmnopqrstuvwxyz1234567890\n",
         );
-        assert!(scan_commit(d.path(), &oid).is_err());
+        assert!(scan_commit(d.path(), &oid, "").is_err());
     }
 }
