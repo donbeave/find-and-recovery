@@ -775,10 +775,28 @@ fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository 
         }
         r.unreachable_noncommits
             .retain(|oid| !represented.contains(oid));
-        match git(path, &["lfs", "ls-files", "--all", "--long"]) {
-            Ok(x) => r.lfs_files = x.lines().map(str::to_owned).collect(),
-            Err(e) => return Err(format!("could not inventory LFS payloads: {e}")),
+        let mut lfs_commits = r
+            .refs
+            .iter()
+            .filter_map(|entry| entry.split_whitespace().next())
+            .filter_map(|reference| {
+                git(path, &["rev-parse", &format!("{reference}^{{commit}}")])
+                    .ok()
+                    .map(|oid| oid.trim().to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        lfs_commits.extend(
+            r.worktrees
+                .iter()
+                .filter_map(|worktree| worktree.head.clone()),
+        );
+        let mut lfs_files = BTreeSet::new();
+        for commit in lfs_commits {
+            let files = git(path, &["lfs", "ls-files", "--long", &commit])
+                .map_err(|error| format!("could not inventory LFS payloads: {error}"))?;
+            lfs_files.extend(files.lines().map(str::to_owned));
         }
+        r.lfs_files = lfs_files.into_iter().collect();
         Ok(())
     };
     if let Err(e) = collect() {
@@ -1341,11 +1359,8 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     && tail.split_whitespace().nth(1) == Some("commit"));
             (!supported).then_some(name)
         });
-        if let Some(reference) = unsupported {
-            r.verification_error =
-                Some(format!("unsupported local ref blocks cleanup: {reference}"));
-            continue;
-        }
+        let mut blocker = unsupported
+            .map(|reference| format!("unsupported local ref blocks cleanup: {reference}"));
         let path = PathBuf::from(&r.path);
         let remote = m.remote.clone();
         if !r.lfs_files.is_empty() {
@@ -1423,7 +1438,7 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             }
             mapped.insert(branch.commit);
         }
-        if failure.is_none() {
+        {
             for entry in r.refs.clone() {
                 let Some((name, tail)) = entry.split_once(' ') else {
                     continue;
@@ -1444,17 +1459,17 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     oid,
                     "recovery-local",
                 ) {
-                    failure = Some(error);
-                    break;
+                    failure.get_or_insert(error);
+                    continue;
                 }
                 mapped.insert(oid.to_owned());
             }
         }
-        if failure.is_none() {
+        {
             for (index, stash) in stashes.iter().enumerate() {
                 let Some(oid) = stash.split_whitespace().next() else {
-                    failure = Some("malformed stash inventory".into());
-                    break;
+                    failure.get_or_insert("malformed stash inventory".into());
+                    continue;
                 };
                 if let Err(error) = save_object(
                     &remote,
@@ -1465,12 +1480,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     oid,
                     "stash",
                 ) {
-                    failure = Some(error);
-                    break;
+                    failure.get_or_insert(error);
+                    continue;
                 }
             }
         }
-        if failure.is_none() {
+        {
             for oid in unreachable {
                 if let Err(error) = save_object(
                     &remote,
@@ -1481,32 +1496,35 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     &oid,
                     "unreachable",
                 ) {
-                    failure = Some(error);
-                    break;
+                    failure.get_or_insert(error);
+                    continue;
                 }
                 mapped.insert(oid);
             }
         }
-        if failure.is_none() {
+        {
             for worktree in worktrees {
                 if worktree.bare || worktree.foreign_registration {
                     continue;
                 }
                 if !worktree.ignored.is_empty() {
-                    failure = Some(format!(
+                    blocker.get_or_insert(format!(
                         "worktree has ignored content; snapshot blocked: {}",
                         worktree.path
                     ));
-                    break;
+                    continue;
                 }
                 if let Err(error) = validate_nested_inventory(&worktree) {
-                    failure = Some(error);
-                    break;
+                    blocker.get_or_insert(error);
+                    continue;
                 }
                 if worktree.detached {
                     let Some(head) = worktree.head.as_deref() else {
-                        failure = Some(format!("detached worktree has no HEAD: {}", worktree.path));
-                        break;
+                        blocker.get_or_insert(format!(
+                            "detached worktree has no HEAD: {}",
+                            worktree.path
+                        ));
+                        continue;
                     };
                     if !mapped.contains(head) {
                         if let Err(error) = save_object(
@@ -1518,21 +1536,21 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                             head,
                             "detached",
                         ) {
-                            failure = Some(error);
-                            break;
+                            failure.get_or_insert(error);
+                            continue;
                         }
                         mapped.insert(head.to_owned());
                     }
                 }
                 if !worktree.missing {
                     if let Err(error) = save_worktree(&remote, &common, r, &worktree) {
-                        failure = Some(error);
-                        break;
+                        failure.get_or_insert(error);
+                        continue;
                     }
                 }
             }
         }
-        if failure.is_none() && !r.unreachable_noncommits.is_empty() {
+        if !r.unreachable_noncommits.is_empty() {
             let mut represented = BTreeSet::new();
             for saved in &r.saved {
                 if let Ok(objects) = git(&path, &["rev-list", "--objects", &saved.commit]) {
@@ -1548,12 +1566,12 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 .iter()
                 .find(|oid| !represented.contains(*oid))
             {
-                failure = Some(format!(
+                blocker.get_or_insert(format!(
                     "unreachable object not included in pushed recovery commits: {oid}"
                 ));
             }
         }
-        if let Some(error) = failure {
+        if let Some(error) = failure.or(blocker) {
             r.preservation = "blocked".into();
             r.verification_error = Some(error);
         }
@@ -2798,6 +2816,45 @@ mod preservation_tests {
         let state = local.parent().unwrap().join("external-state");
         assert!(cleanup_repository(&m.repositories[0], &remote_s, &state).is_err());
         assert!(local.exists());
+    }
+
+    #[test]
+    fn unsupported_tag_blocks_cleanup_but_does_not_skip_branch_pushes() {
+        let (_temp, local, remote, remote_url) = fixture();
+        cmd(&["git", "-C", local.to_str().unwrap(), "tag", "local-only"]);
+        let mut manifest = manifest(&local, &remote_url);
+        preserve(&mut manifest).unwrap();
+        assert_eq!(manifest.repositories[0].preservation, "blocked");
+        assert!(
+            manifest.repositories[0]
+                .verification_error
+                .as_deref()
+                .unwrap()
+                .contains("refs/tags/")
+        );
+        let branch = manifest.repositories[0]
+            .saved
+            .iter()
+            .find(|saved| saved.source == "branch")
+            .unwrap();
+        assert_eq!(
+            remote_oid(&remote_url, &format!("refs/heads/{}", branch.remote_ref))
+                .unwrap()
+                .as_deref(),
+            Some(branch.commit.as_str())
+        );
+        assert!(local.exists());
+        assert_eq!(
+            cmd(&[
+                "git",
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/tags",
+            ]),
+            ""
+        );
     }
 }
 
