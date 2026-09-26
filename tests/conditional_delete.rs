@@ -1,7 +1,7 @@
 #[path = "../src/conditional_delete.rs"]
 mod conditional_delete;
 
-use conditional_delete::{delete_candidates_if_unchanged, delete_if_unchanged, Candidate};
+use conditional_delete::{Candidate, delete_candidates_if_unchanged, delete_if_unchanged};
 use std::path::Path;
 use std::process::Command;
 

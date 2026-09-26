@@ -3,6 +3,7 @@ mod lfs_batch;
 #[path = "../src/remote_lfs.rs"]
 mod remote_lfs;
 
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -125,6 +126,21 @@ impl Fixture {
             size: self.payload.len() as u64,
         }
     }
+
+    fn add_orphan_local_payload(&self, payload: &[u8]) -> String {
+        let oid = format!("{:x}", Sha256::digest(payload));
+        let path = self
+            .work
+            .join(".git")
+            .join("lfs")
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(&oid);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, payload).unwrap();
+        oid
+    }
 }
 
 #[test]
@@ -172,6 +188,20 @@ fn local_payload_validation_accepts_bytes_matching_pointer() {
 }
 
 #[test]
+fn local_payload_validation_blocks_unreferenced_private_lfs_payloads() {
+    let fixture = Fixture::new();
+    let orphan_oid = fixture.add_orphan_local_payload(b"orphaned local LFS payload");
+    let error =
+        remote_lfs::validate_local_lfs_payloads(&fixture.work, &[fixture.expected_object()])
+            .unwrap_err();
+    assert!(
+        error.contains("unreferenced local Git LFS payload"),
+        "{error}"
+    );
+    assert!(error.contains(&orphan_oid), "{error}");
+}
+
+#[test]
 fn local_inventory_includes_pointer_from_ancestor_removed_at_tip() {
     let fixture = Fixture::new();
     fixture.remove_lfs_file_at_tip();
@@ -186,6 +216,166 @@ fn local_inventory_includes_pointer_from_ancestor_removed_at_tip() {
     let saved = remote_lfs::inventory_local_lfs_commits(&fixture.work, &[tip]).unwrap();
     assert_eq!(saved, vec![fixture.expected_object()]);
     remote_lfs::validate_local_lfs_payloads(&fixture.work, &saved).unwrap();
+}
+
+#[test]
+fn local_inventory_ignores_replacement_refs_when_reading_original_history() {
+    let fixture = Fixture::new();
+    let original = git(Some(&fixture.work), &["rev-parse", "HEAD"]);
+    fixture.remove_lfs_file_at_tip();
+    let tree = git(Some(&fixture.work), &["rev-parse", "HEAD^{tree}"]);
+    let replacement = git(
+        Some(&fixture.work),
+        &[
+            "commit-tree",
+            &tree,
+            "-m",
+            "replacement without LFS pointer",
+        ],
+    );
+    git(Some(&fixture.work), &["replace", &original, &replacement]);
+
+    let objects =
+        remote_lfs::inventory_local_lfs_commits(&fixture.work, std::slice::from_ref(&original))
+            .unwrap();
+    assert_eq!(objects, vec![fixture.expected_object()]);
+}
+
+#[test]
+fn local_inventory_includes_lfs_pointer_from_stash_untracked_parent() {
+    let fixture = Fixture::new();
+    let stash_payload = b"untracked stash LFS payload".repeat(128);
+    fs::write(fixture.work.join("stash-only.bin"), &stash_payload).unwrap();
+    git(
+        Some(&fixture.work),
+        &[
+            "stash",
+            "push",
+            "--include-untracked",
+            "--quiet",
+            "-m",
+            "LFS stash",
+        ],
+    );
+    let stash = git(Some(&fixture.work), &["rev-parse", "refs/stash"]);
+
+    let objects =
+        remote_lfs::inventory_local_lfs_commits(&fixture.work, std::slice::from_ref(&stash))
+            .unwrap();
+    assert!(objects.contains(&fixture.expected_object()));
+    assert!(
+        objects
+            .iter()
+            .any(|object| object.size == stash_payload.len() as u64)
+    );
+    remote_lfs::validate_local_lfs_payloads(&fixture.work, &objects).unwrap();
+}
+
+#[test]
+fn local_inventory_includes_lfs_pointer_from_detached_commit_history() {
+    let fixture = Fixture::new();
+    let detached_payload = b"detached history LFS payload".repeat(128);
+    git(
+        Some(&fixture.work),
+        &["checkout", "--detach", "--quiet", "HEAD"],
+    );
+    fs::write(fixture.work.join("detached-only.bin"), &detached_payload).unwrap();
+    git(Some(&fixture.work), &["add", "detached-only.bin"]);
+    git(
+        Some(&fixture.work),
+        &["commit", "--quiet", "-m", "detached LFS history"],
+    );
+    let detached_head = git(Some(&fixture.work), &["rev-parse", "HEAD"]);
+
+    let objects = remote_lfs::inventory_local_lfs_commits(
+        &fixture.work,
+        std::slice::from_ref(&detached_head),
+    )
+    .unwrap();
+    assert!(objects.contains(&fixture.expected_object()));
+    assert!(
+        objects
+            .iter()
+            .any(|object| object.size == detached_payload.len() as u64)
+    );
+    remote_lfs::validate_local_lfs_payloads(&fixture.work, &objects).unwrap();
+}
+
+#[test]
+fn local_inventory_blocks_shallow_history_that_can_hide_ancestor_pointers() {
+    let fixture = Fixture::new();
+    fixture.remove_lfs_file_at_tip();
+    let clone = fixture._temp.path().join("shallow-clone");
+    let remote_url = format!("file://{}", fixture.remote.display());
+    git(
+        None,
+        &["clone", "--quiet", "--depth", "1", &remote_url, p(&clone)],
+    );
+    let head = git(Some(&clone), &["rev-parse", "HEAD"]);
+
+    let error = remote_lfs::inventory_local_lfs_commits(&clone, &[head]).unwrap_err();
+    assert!(
+        error.contains("shallow Git history is incomplete"),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_inventory_blocks_grafts_that_change_the_history_view() {
+    let fixture = Fixture::new();
+    fs::write(fixture.work.join(".git/info/grafts"), b"history override\n").unwrap();
+    let head = git(Some(&fixture.work), &["rev-parse", "HEAD"]);
+
+    let error = remote_lfs::inventory_local_lfs_commits(&fixture.work, &[head]).unwrap_err();
+    assert!(error.contains("Git grafts alter commit history"), "{error}");
+}
+
+#[test]
+fn fresh_verifier_downloads_lfs_from_detached_recovery_history() {
+    let fixture = Fixture::new();
+    let detached_payload = b"detached remote LFS payload".repeat(128);
+    git(
+        Some(&fixture.work),
+        &["checkout", "--detach", "--quiet", "HEAD"],
+    );
+    fs::write(fixture.work.join("detached-only.bin"), &detached_payload).unwrap();
+    git(Some(&fixture.work), &["add", "detached-only.bin"]);
+    git(
+        Some(&fixture.work),
+        &["commit", "--quiet", "-m", "detached LFS history"],
+    );
+    git(
+        Some(&fixture.work),
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            "HEAD:refs/heads/recovery/detached",
+        ],
+    );
+    git(Some(&fixture.work), &["rm", "--quiet", "detached-only.bin"]);
+    git(
+        Some(&fixture.work),
+        &["commit", "--quiet", "-m", "remove detached LFS file"],
+    );
+    git(
+        Some(&fixture.work),
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            "HEAD:refs/heads/recovery/detached",
+        ],
+    );
+
+    let reference = "refs/heads/recovery/detached".to_owned();
+    let objects = remote_lfs::verify_remote_lfs_refs(p(&fixture.remote), &[reference]).unwrap();
+    assert!(objects.contains(&fixture.expected_object()));
+    assert!(
+        objects
+            .iter()
+            .any(|object| object.size == detached_payload.len() as u64)
+    );
 }
 
 #[test]

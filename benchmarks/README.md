@@ -12,38 +12,53 @@ Build and run:
 cargo build --release
 benchmarks/dedupe.sh --branches 500 --mode aliases
 benchmarks/dedupe.sh --branches 500 --mode linear-same-tree
-benchmarks/dedupe.sh --branches 500 --mode divergent-same-tree
+benchmarks/dedupe.sh --branches 500 --mode divergent-same-tree --history-depth 8
 benchmarks/dedupe.sh --branches 500 --mode distinct-trees --blob-mb 64
 ```
 
 Options: `--binary PATH` selects the executable (defaults to
 `target/release/find-and-recovery`); `--branches N` controls the number of
-`recovery/bench/*` refs; `--blob-mb N` adds an incompressible blob to the base
-history. The remote also has a `main` ref. The manifest uses
-`repositories: []`, so the run remains preview-only and cannot authorize
-deletion. Compatibility names are `shared=aliases`, `linear=linear-same-tree`,
-and `divergent=distinct-trees`.
+`recovery/find-and-recovery/bench/*` refs; `--blob-mb N` adds an incompressible
+blob to the base history. `--history-depth N` controls each independent history
+in `divergent-same-tree` (default 1). The remote has a `main` ref and advertises
+it as the default. A temporary manifest marks only generated benchmark refs
+as owned, so preview can display candidates. It never passes `--execute`, and
+current CLI code refuses remote deletion even when `--execute` is requested.
+Compatibility names are `shared=aliases`, `linear=linear-same-tree`, and
+`divergent=distinct-trees`.
 
-The fixture modes cover the duplicate planner's important cases:
+The fixture modes cover the planner's proof cases:
 
-* `aliases`: every benchmark ref points to the same commit.
-* `linear-same-tree`: each ref points to a different empty commit in one
-  linear history, so the commit IDs differ while the tree is identical.
-* `divergent-same-tree`: each ref points to a different empty commit whose
-  parent is the common base, so histories are incomparable while the tree is
-  identical.
-* `distinct-trees`: each ref adds a different file, so the committed trees
-  differ.
+* `aliases`: every benchmark ref points to the same commit. Exact OID equality
+  proves these are aliases.
+* `linear-same-tree`: refs point to successive empty commits in one linear
+  history. Earlier tips are contained in later tips through actual parent
+  edges, even though all trees are equal.
+* `divergent-same-tree`: each ref points to a separate chain of empty commits
+  rooted at the common base. Set `--history-depth` to increase each chain.
+  Trees are equal, but branch histories remain incomparable.
+* `distinct-trees`: each ref adds a different file. Equal commit counts or
+  similar shapes do not prove containment.
 
-The current planner groups by committed tree, keeps `main` when it is in the
-group, then ranks the remaining branches by reachable commit count with a
-deterministic lexical tie break. Lower-ranked candidates are planned for
-create-only archive refs before branch deletion.
+The planner may remove a tip only when it has an exact-OID alias among retained
+refs or is reachable from a retained tip in the full parent graph. Tree equality,
+commit counts, diffs, and names are not proof. The fixture's `main` is a durable
+base and the bare remote advertises it as its default branch.
+
+The harness runs the CLI's read-only preview path and never passes
+`--execute`. The active planner uses exact OID equality and reachability through
+the full commit-parent graph. The preview reports every retained branch and
+each candidate's expected OID, relation, survivor, survivor OID, and reason.
+It does not mutate remote refs: execution remains disabled until server branch
+protection and active pull request facts are verified. Use
+`dedupe --all-unprotected --json` to inspect the broader all-branch scope in
+machine-readable form; the benchmark uses the default tool-owned-ref scope.
 
 The report includes total and benchmark branch counts, reachable commit count,
 fixture mode, bare remote object storage size, Trace2 Git child-process count,
-CLI output size, and wall/user/system seconds. On macOS it also reports peak
-resident bytes from `/usr/bin/time -l`; other platforms report that field as
+CLI output size, and wall/user/system seconds. On macOS it reports peak
+resident bytes from `/usr/bin/time -l`; Linux uses GNU `/usr/bin/time -v` and
+converts its KiB value to bytes. Other platforms report peak RSS as
 `unavailable`. Object storage size comes from `git count-objects -v` and sums
 loose plus packed KiB. A guarded `du` fallback handles Git versions that do not
 provide those counters; a maintenance lock cannot make the benchmark fail.
@@ -53,7 +68,10 @@ on the same host and Git version. `dd /dev/urandom` makes large blobs expensive
 to generate and keeps them poorly compressible; leave `--blob-mb` at zero for
 branch-count-only runs.
 
-This measures the current implementation only. Use all four modes when
-comparing changes: aliases isolates same-tip grouping, the two same-tree modes
-exercise tree comparison, commit-count ranking, and archive/delete planning,
-and distinct-trees measures the non-duplicate path.
+This measures the current read-only planner preview. Use all four modes when
+comparing changes: aliases isolates same-tip grouping,
+`linear-same-tree` measures ancestor containment, `divergent-same-tree` guards
+against treating equal trees as proof, and `distinct-trees` measures the
+no-containment path. Record the CLI version, Git version, host, fixture mode,
+and output with every result. The current report does not measure filesystem
+discovery, LFS transfer, network transfer bytes, cleanup, or end-to-end restore.

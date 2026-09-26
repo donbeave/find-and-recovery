@@ -12,18 +12,18 @@ use std::{
 
 /// Parse a GitHub.com clone URL into its `owner/repository` API path.
 pub fn repository_nwo(remote_url: &str) -> Result<String, String> {
-    let mut value = remote_url.trim().trim_end_matches('/').to_owned();
-    if let Some(path) = value.strip_prefix("git@github.com:") {
-        value = format!("https://github.com/{path}");
-    } else if let Some(path) = value.strip_prefix("ssh://git@github.com/") {
-        value = format!("https://github.com/{path}");
-    }
-    if value.ends_with(".git") {
-        value.truncate(value.len() - 4);
-    }
-    let path = value
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| "atomic create-ref API is supported only for github.com".to_owned())?;
+    let value = remote_url.trim();
+    let path = if let Some((user_host, path)) = value.split_once(':') {
+        if user_host.eq_ignore_ascii_case("git@github.com") {
+            path
+        } else {
+            parse_github_url(value)?
+        }
+    } else {
+        parse_github_url(value)?
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
     let pieces = path.split('/').collect::<Vec<_>>();
     if pieces.len() != 2
         || pieces.iter().any(|part| {
@@ -36,6 +36,43 @@ pub fn repository_nwo(remote_url: &str) -> Result<String, String> {
         return Err("GitHub URL must contain exactly an owner and repository".into());
     }
     Ok(format!("{}/{}", pieces[0], pieces[1]))
+}
+
+fn parse_github_url(value: &str) -> Result<&str, String> {
+    let (scheme, rest) = value
+        .split_once("://")
+        .ok_or_else(|| "atomic create-ref API is supported only for github.com".to_owned())?;
+    let scheme = scheme.to_ascii_lowercase();
+    let (authority, path) = rest
+        .split_once('/')
+        .ok_or_else(|| "GitHub clone URL is missing owner/repository".to_owned())?;
+    let (user, host_port) = match authority.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, authority),
+    };
+    if user.is_some_and(|user| user != "git") {
+        return Err("GitHub SSH URL must use the git user".into());
+    }
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (host, Some(port))
+        }
+        _ => (host_port, None),
+    };
+    let allowed = match scheme.as_str() {
+        "https" => user.is_none() && (port.is_none() || port == Some("443")),
+        "ssh" => user == Some("git") && (port.is_none() || port == Some("22")),
+        _ => false,
+    };
+    if !allowed || !host.eq_ignore_ascii_case("github.com") {
+        return Err("atomic create-ref API is supported only for github.com".into());
+    }
+    if path.contains(['?', '#']) {
+        return Err("GitHub clone URL must not contain a query or fragment".into());
+    }
+    Ok(path)
 }
 
 fn validate_ref_and_oid(reference: &str, oid: &str) -> Result<(), String> {
@@ -66,6 +103,8 @@ fn request_args(nwo: &str, reference: &str, oid: &str) -> Vec<String> {
     vec![
         "gh".into(),
         "api".into(),
+        "--hostname".into(),
+        "github.com".into(),
         "--method".into(),
         "POST".into(),
         format!("repos/{nwo}/git/refs"),
@@ -89,6 +128,7 @@ pub fn create_ref(remote_url: &str, reference: &str, oid: &str) -> Result<(), St
         let output = Command::new(&args[0])
             .args(&args[1..])
             .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_HOST", "github.com")
             .output()
             .map_err(|error| format!("could not start gh create-ref request: {error}"))?;
         if output.status.success() {
@@ -276,8 +316,10 @@ mod tests {
     fn parses_only_supported_github_clone_urls() {
         for url in [
             "https://github.com/ChainArgos/java-monorepo.git",
+            "https://GITHUB.com:443/ChainArgos/java-monorepo.git",
             "git@github.com:ChainArgos/java-monorepo.git",
             "ssh://git@github.com/ChainArgos/java-monorepo.git",
+            "ssh://git@GITHUB.com:22/ChainArgos/java-monorepo.git",
         ] {
             assert_eq!(repository_nwo(url).unwrap(), "ChainArgos/java-monorepo");
         }
@@ -285,6 +327,9 @@ mod tests {
             "https://github.example/owner/repo.git",
             "https://github.com/owner/repo/extra",
             "https://github.com/owner/repo?redirect=elsewhere",
+            "https://github.com:444/owner/repo.git",
+            "ssh://git@github.com:2222/owner/repo.git",
+            "ssh://alice@github.com/owner/repo.git",
         ] {
             assert!(repository_nwo(url).is_err(), "accepted {url}");
         }
@@ -298,11 +343,13 @@ mod tests {
         let create = |refs: &mut BTreeMap<String, String>, args: &[String]| {
             assert_eq!(args[0], "gh");
             assert_eq!(args[1], "api");
-            assert_eq!(args[2], "--method");
-            assert_eq!(args[3], "POST");
-            assert_eq!(args[4], "repos/ChainArgos/java-monorepo/git/refs");
-            let ref_value = args[6].strip_prefix("ref=").unwrap().to_owned();
-            let oid_value = args[8].strip_prefix("sha=").unwrap().to_owned();
+            assert_eq!(args[2], "--hostname");
+            assert_eq!(args[3], "github.com");
+            assert_eq!(args[4], "--method");
+            assert_eq!(args[5], "POST");
+            assert_eq!(args[6], "repos/ChainArgos/java-monorepo/git/refs");
+            let ref_value = args[8].strip_prefix("ref=").unwrap().to_owned();
+            let oid_value = args[10].strip_prefix("sha=").unwrap().to_owned();
             if refs.contains_key(&ref_value) {
                 return Err("422 Reference already exists".into());
             }

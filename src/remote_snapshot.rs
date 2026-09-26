@@ -13,12 +13,25 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemoteHistorySnapshot {
+    pub branches: Vec<BranchSnapshot>,
+    /// Complete parent adjacency for commits reachable from advertised heads.
+    pub commit_parents: BTreeMap<String, BTreeSet<String>>,
+}
+
 /// Fetch every remote head into a fresh isolated bare repository and return
 /// its tip, tree, and reachable commit count for duplicate-tree groups.
 ///
 /// Any remote movement during the fetch, malformed ref output, missing commit
 /// or tree object, or Git failure aborts the snapshot.
 pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, String> {
+    Ok(fetch_remote_history(remote)?.branches)
+}
+
+/// Fetch branch tips and their complete commit-parent graph into one isolated
+/// object database. Shallow or replacement-distorted history is rejected.
+pub fn fetch_remote_history(remote: &str) -> Result<RemoteHistorySnapshot, String> {
     let before = list_heads(remote)?;
     let temp = tempfile::Builder::new()
         .prefix("find-recovery-remote-snapshot-")
@@ -59,41 +72,29 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
         return Err("fetched branch refs do not match the initial remote head listing".into());
     }
 
-    let trees = batch_commit_trees(&git_dir, fetched.values())?;
-    verify_tree_objects(&git_dir, trees.values())?;
-    let mut by_tree: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for (refname, oid) in &fetched {
-        let branch = refname
-            .strip_prefix("refs/remotes/snapshot/")
-            .ok_or_else(|| format!("unexpected fetched ref name: {refname}"))?;
-        let tree = trees
-            .get(oid)
-            .ok_or_else(|| format!("missing tree result for commit {oid}"))?
-            .clone();
-        by_tree
-            .entry(tree)
-            .or_default()
-            .push((branch.to_owned(), oid.clone()));
+    let shallow = git_in(
+        Some(&git_dir),
+        [
+            OsStr::new("rev-parse"),
+            OsStr::new("--is-shallow-repository"),
+        ],
+    )?;
+    if String::from_utf8_lossy(&shallow.stdout).trim() != "false" {
+        return Err("remote snapshot has shallow history; refusing ancestry proof".into());
     }
 
-    let mut counts = BTreeMap::<String, u64>::new();
-    let unique_oids = fetched.values().cloned().collect::<BTreeSet<_>>();
-    for oid in unique_oids {
-        let output = git_in(
-            Some(&git_dir),
-            [
-                OsStr::new("rev-list"),
-                OsStr::new("--count"),
-                OsStr::new(&oid),
-            ],
-        )?;
-        let count = String::from_utf8(output.stdout)
-            .map_err(|_| format!("non-UTF-8 commit count for {oid}"))?
-            .trim()
-            .parse::<u64>()
-            .map_err(|error| format!("invalid commit count for {oid}: {error}"))?;
-        counts.insert(oid, count);
-    }
+    let trees = batch_commit_trees(&git_dir, fetched.values())?;
+    verify_tree_objects(&git_dir, trees.values())?;
+    let graph_output = git_in(
+        Some(&git_dir),
+        [
+            OsStr::new("rev-list"),
+            OsStr::new("--parents"),
+            OsStr::new("--all"),
+        ],
+    )?;
+    let commit_parents = parse_parent_graph(&graph_output.stdout)?;
+    let counts = reachable_commit_counts(&commit_parents, fetched.values());
 
     let mut snapshots = Vec::with_capacity(fetched.len());
     for (refname, oid) in fetched {
@@ -109,9 +110,11 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
             name,
             oid: oid.clone(),
             tree_oid,
+            // Derive compatibility metadata from the same isolated graph used
+            // for ancestry checks. This avoids repeated Git walks per ref.
             commit_count: *counts
                 .get(&oid)
-                .ok_or_else(|| format!("missing commit count for {oid}"))?,
+                .ok_or_else(|| format!("missing reachable count for commit {oid}"))?,
         });
     }
 
@@ -119,7 +122,56 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
     if before != after {
         return Err("remote branch tips changed while taking snapshot".into());
     }
-    Ok(snapshots)
+    Ok(RemoteHistorySnapshot {
+        branches: snapshots,
+        commit_parents,
+    })
+}
+
+fn reachable_commit_counts<'a>(
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    tips: impl Iterator<Item = &'a String>,
+) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for tip in tips {
+        if counts.contains_key(tip) {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![tip.clone()];
+        while let Some(oid) = pending.pop() {
+            if !seen.insert(oid.clone()) {
+                continue;
+            }
+            if let Some(parents) = graph.get(&oid) {
+                pending.extend(parents.iter().cloned());
+            }
+        }
+        counts.insert(tip.clone(), seen.len() as u64);
+    }
+    counts
+}
+
+fn parse_parent_graph(bytes: &[u8]) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "commit graph is not UTF-8".to_owned())?;
+    let mut graph = BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let oid = fields.next().ok_or("empty commit graph row")?;
+        let parents = fields.map(str::to_owned).collect::<BTreeSet<_>>();
+        if graph.insert(oid.to_owned(), parents).is_some() {
+            return Err(format!("duplicate commit graph row: {oid}"));
+        }
+    }
+    if graph.is_empty() {
+        return Err("remote snapshot contains no commit history".into());
+    }
+    for parents in graph.values() {
+        if parents.iter().any(|parent| !graph.contains_key(parent)) {
+            return Err("remote commit graph is incomplete; refusing ancestry proof".into());
+        }
+    }
+    Ok(graph)
 }
 
 /// Read the advertised default branch. If the remote omits symbolic HEAD,
