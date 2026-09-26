@@ -94,6 +94,11 @@ pub fn snapshot_worktree(repo: &Path) -> Result<WorktreeTreeSnapshot, String> {
             "initialize isolated staged index",
         )?;
     }
+    // `write-tree` can reuse a tree already present in the object database
+    // without opening every blob named by the index. Validate each index entry
+    // first so a dangling/corrupt index cannot be reported as a preserved
+    // snapshot merely because its tree object happens to exist.
+    validate_index_objects(&root, &staged_index, &object_store)?;
     let staged_tree_oid = git_stdout(
         &root,
         ["write-tree"],
@@ -144,6 +149,59 @@ pub fn snapshot_worktree(repo: &Path) -> Result<WorktreeTreeSnapshot, String> {
         staged_tree_oid,
         worktree_tree_oid,
     })
+}
+
+fn validate_index_objects(
+    repo: &Path,
+    index: &Path,
+    object_store: &IsolatedObjectStore<'_>,
+) -> Result<(), String> {
+    let output = git_checked(
+        repo,
+        ["ls-files", "--stage", "-z"],
+        Some(index),
+        Some(object_store),
+        None,
+        "inspect isolated staged index objects",
+    )?;
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some(separator) = entry.iter().position(|byte| *byte == b'\t') else {
+            return Err("write isolated staged tree failed: malformed staged index entry".into());
+        };
+        let metadata = std::str::from_utf8(&entry[..separator])
+            .map_err(|_| "write isolated staged tree failed: non-UTF-8 index metadata")?;
+        let mut fields = metadata.split_ascii_whitespace();
+        let mode = fields
+            .next()
+            .ok_or("write isolated staged tree failed: missing index mode")?;
+        let oid = fields
+            .next()
+            .ok_or("write isolated staged tree failed: missing index object ID")?;
+        if fields.next().is_none() || fields.next().is_some() {
+            return Err(
+                "write isolated staged tree failed: malformed staged index metadata".into(),
+            );
+        }
+        let expected_type = if mode == "160000" { "commit" } else { "blob" };
+        let actual_type = git_stdout(
+            repo,
+            ["cat-file", "-t", oid],
+            Some(index),
+            Some(object_store),
+            None,
+            "write isolated staged tree",
+        )?;
+        if actual_type != expected_type {
+            return Err(format!(
+                "write isolated staged tree failed: index object {oid} has type {actual_type}, expected {expected_type}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct IsolatedObjectStore<'a> {
