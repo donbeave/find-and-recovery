@@ -43,10 +43,15 @@ enum Phase {
         path: PathBuf,
     },
     Preserve,
-    Preview,
+    Preview {
+        #[arg(long)]
+        branches_only: bool,
+    },
     Cleanup {
         #[arg(long)]
         execute: bool,
+        #[arg(long)]
+        branches_only: bool,
     },
     Dedupe {
         #[arg(long)]
@@ -911,7 +916,14 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
                     gaps.push(format!("cannot read Git common dir: {}", p.display()));
                     continue;
                 };
-                let owner = if common.file_name().is_some_and(|n| n == ".git") {
+                let common_is_target_bare = common.is_dir()
+                    && common.join("HEAD").is_file()
+                    && common.join("config").is_file()
+                    && common.join("objects").is_dir()
+                    && target_path(&common, remote);
+                let owner = if common_is_target_bare {
+                    common.clone()
+                } else if common.file_name().is_some_and(|n| n == ".git") {
                     common.parent().unwrap_or(p).to_path_buf()
                 } else {
                     p.to_path_buf()
@@ -1941,26 +1953,30 @@ fn same_inventory(expected: &Repository, current: &Repository) -> bool {
                     && a.fingerprint == b.fingerprint
             })
 }
-fn cleanup_blocker(r: &Repository) -> Option<String> {
+fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
     if temporary_recovery_fixture(Path::new(&r.path)) {
         return Some("blocked-temporary-recovery-fixture".into());
     }
     if !r.inventory_complete {
         return Some("blocked-incomplete-inventory".into());
     }
-    if r.preservation != "complete" {
+    if !branches_only && r.preservation != "complete" {
         return Some("blocked-preservation".into());
     }
     if r.saved
         .iter()
-        .any(|saved| saved.verification != "push-succeeded")
+        .any(|saved| saved.source == "branch" && saved.verification != "push-succeeded")
     {
         return Some("blocked-push-not-successful".into());
     }
-    if !r.lfs_files.is_empty() && r.lfs_preservation != "push-succeeded" {
+    if !branches_only && !r.lfs_files.is_empty() && r.lfs_preservation != "push-succeeded" {
         return Some("blocked-LFS-payloads".into());
     }
-    for worktree in r.worktrees.iter().filter(|w| !w.ignored.is_empty()) {
+    for worktree in r
+        .worktrees
+        .iter()
+        .filter(|w| !branches_only && !w.ignored.is_empty())
+    {
         if !r.saved.iter().any(|saved| {
             saved.source == "worktree-snapshot"
                 && saved.name == format!("worktree:{}", worktree.path)
@@ -1972,8 +1988,14 @@ fn cleanup_blocker(r: &Repository) -> Option<String> {
             ));
         }
     }
-    if !r.alternates.is_empty() {
-        return Some("blocked-shared-storage".into());
+    for alternate in &r.alternates {
+        let alternate = match Path::new(alternate).canonicalize() {
+            Ok(path) if path.is_dir() => path,
+            _ => return Some("blocked-shared-storage-unresolved-alternate".into()),
+        };
+        if alternate.starts_with(Path::new(&r.path)) {
+            return Some("blocked-shared-storage-inside-deletion-root".into());
+        }
     }
     if r.kind != "clone" && r.kind != "bare" {
         return Some("blocked-repository-kind".into());
@@ -1997,7 +2019,8 @@ fn cleanup_blocker(r: &Repository) -> Option<String> {
         }
     }
     for w in &r.worktrees {
-        if w.detached
+        if !branches_only
+            && w.detached
             && !r
                 .branches
                 .iter()
@@ -2025,16 +2048,53 @@ fn cleanup_blocker(r: &Repository) -> Option<String> {
     }
     None
 }
-fn preview(m: &mut Manifest) {
+fn preview(m: &mut Manifest, branches_only: bool) {
     let deleted = m.deleted.iter().cloned().collect::<BTreeSet<_>>();
     for r in &mut m.repositories {
         if deleted.contains(&r.path) && !Path::new(&r.path).exists() {
             r.deletion = "deleted".into();
             continue;
         }
-        r.deletion = cleanup_blocker(r).unwrap_or_else(|| "eligible".into());
+        r.deletion = cleanup_blocker(r, branches_only).unwrap_or_else(|| "eligible".into());
     }
 }
+fn branch_saved(r: &Repository) -> impl Iterator<Item = &Saved> {
+    r.saved.iter().filter(|saved| saved.source == "branch")
+}
+
+fn cleanup_recheck_branches(r: &Repository, remote: &str) -> Result<(), String> {
+    let owner = Path::new(&r.path);
+    if !target_path(owner, remote) {
+        return Err("repository remote no longer matches requested target".into());
+    }
+    if branch_inventory(owner)? != r.branches {
+        return Err("local branches changed since inventory".into());
+    }
+    let current = parse_worktrees(owner)?;
+    if current.len() != r.worktrees.len()
+        || current.iter().zip(&r.worktrees).any(|(now, expected)| {
+            now.path != expected.path
+                || now.head != expected.head
+                || now.branch != expected.branch
+                || now.detached != expected.detached
+                || now.bare != expected.bare
+                || now.missing != expected.missing
+        })
+    {
+        return Err("registered worktrees changed since inventory".into());
+    }
+    for saved in branch_saved(r) {
+        let reference = format!("refs/heads/{}", saved.remote_ref);
+        if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+            return Err(format!(
+                "pushed branch ref missing or changed: {}",
+                saved.remote_ref
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
     let owner = Path::new(&r.path);
     if !target_path(owner, remote) {
@@ -2177,8 +2237,13 @@ fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<String>, String> {
-    if let Some(reason) = cleanup_blocker(r) {
+fn cleanup_repository(
+    r: &Repository,
+    remote: &str,
+    state: &Path,
+    branches_only: bool,
+) -> Result<Vec<String>, String> {
+    if let Some(reason) = cleanup_blocker(r, branches_only) {
         return Err(reason);
     }
     let owner = PathBuf::from(&r.path);
@@ -2186,7 +2251,11 @@ fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<
     if !md.is_dir() || md.file_type().is_symlink() {
         return Err("repository path is not an exact real directory".into());
     }
-    cleanup_recheck(r, remote)?;
+    if branches_only {
+        cleanup_recheck_branches(r, remote)?;
+    } else {
+        cleanup_recheck(r, remote)?;
+    }
     let owner_canon = fs::canonicalize(&owner).map_err(|e| e.to_string())?;
     let common_canon = fs::canonicalize(&r.common_dir).map_err(|e| e.to_string())?;
     if !common_canon.starts_with(&owner_canon) {
@@ -2245,7 +2314,11 @@ fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<
     }
     let root = Path::new(&root_before.path);
     if r.kind == "bare" {
-        for saved in &r.saved {
+        for saved in if branches_only {
+            branch_saved(r).collect::<Vec<_>>()
+        } else {
+            r.saved.iter().collect::<Vec<_>>()
+        } {
             let reference = format!("refs/heads/{}", saved.remote_ref);
             if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
                 return Err(format!(
@@ -2259,6 +2332,27 @@ fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<
         }
         fs::remove_dir_all(&owner)
             .map_err(|e| format!("remove exact bare repository {}: {e}", owner.display()))?;
+        removed.push(owner.to_string_lossy().into_owned());
+        return Ok(removed);
+    }
+    if branches_only {
+        if branch_inventory(root)? != r.branches {
+            return Err("local branches changed immediately before deletion".into());
+        }
+        for saved in branch_saved(r) {
+            let reference = format!("refs/heads/{}", saved.remote_ref);
+            if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+                return Err(format!(
+                    "pushed branch ref changed immediately before deletion: {}",
+                    saved.remote_ref
+                ));
+            }
+        }
+        if filesystem_identity(&owner) != r.device.zip(r.inode) {
+            return Err("repository device/inode changed immediately before deletion".into());
+        }
+        fs::remove_dir_all(&owner)
+            .map_err(|e| format!("remove exact clone {}: {e}", owner.display()))?;
         removed.push(owner.to_string_lossy().into_owned());
         return Ok(removed);
     }
@@ -2516,15 +2610,18 @@ fn main() -> Result<(), String> {
             save(&m, &state)?;
             println!("refreshed\t{}", path.display());
         }
-        Phase::Preview => {
-            preview(&mut m);
+        Phase::Preview { branches_only } => {
+            preview(&mut m, branches_only);
             save(&m, &state)?;
             for r in &m.repositories {
                 println!("{}\t{}", r.deletion, r.path)
             }
         }
-        Phase::Cleanup { execute } => {
-            preview(&mut m);
+        Phase::Cleanup {
+            execute,
+            branches_only,
+        } => {
+            preview(&mut m, branches_only);
             if !execute {
                 for r in &m.repositories {
                     if r.deletion == "eligible" {
@@ -2539,7 +2636,7 @@ fn main() -> Result<(), String> {
                         println!("{}\t{}", m.repositories[i].deletion, m.repositories[i].path);
                         continue;
                     }
-                    match cleanup_repository(&m.repositories[i], &m.remote, &state) {
+                    match cleanup_repository(&m.repositories[i], &m.remote, &state, branches_only) {
                         Ok(paths) => {
                             m.repositories[i].deletion = "deleted".into();
                             m.deleted.extend(paths);
@@ -2758,11 +2855,11 @@ mod preservation_tests {
             ]),
             original_main
         );
-        preview(&mut m);
+        preview(&mut m, false);
         assert_eq!(m.repositories[0].deletion, "eligible");
         let state = local.parent().unwrap().join("external-state");
         fs::create_dir_all(&state).unwrap();
-        cleanup_repository(&m.repositories[0], &remote_s, &state).unwrap();
+        cleanup_repository(&m.repositories[0], &remote_s, &state, false).unwrap();
         assert!(!local.exists());
     }
 
@@ -2805,11 +2902,11 @@ mod preservation_tests {
             &format!("refs/heads/{}", pushed.remote_ref),
         ]);
         assert_eq!(remote_oid, pushed.commit);
-        preview(&mut m);
+        preview(&mut m, false);
         assert_eq!(m.repositories[0].deletion, "eligible");
         let state = local.parent().unwrap().join("external-state");
         fs::create_dir_all(&state).unwrap();
-        let removed = cleanup_repository(&m.repositories[0], &remote_s, &state).unwrap();
+        let removed = cleanup_repository(&m.repositories[0], &remote_s, &state, false).unwrap();
         assert_eq!(removed, vec![local.to_string_lossy().into_owned()]);
         assert!(!local.exists());
     }
@@ -2963,12 +3060,12 @@ mod preservation_tests {
         let mut m = manifest(&local, &remote_s);
         preserve(&mut m).unwrap();
         assert_eq!(m.repositories[0].preservation, "complete");
-        preview(&mut m);
+        preview(&mut m, false);
         assert_eq!(m.repositories[0].deletion, "eligible");
         let state = local.parent().unwrap().join("external-state");
         fs::create_dir_all(&state).unwrap();
         let linked_canon = fs::canonicalize(&linked).unwrap();
-        let removed = cleanup_repository(&m.repositories[0], &remote_s, &state).unwrap();
+        let removed = cleanup_repository(&m.repositories[0], &remote_s, &state, false).unwrap();
         assert!(removed.iter().any(|p| Path::new(p) == linked_canon));
         assert!(!linked.exists(), "linked worktree still exists");
         assert!(removed.iter().any(|p| p == local.to_str().unwrap()));
@@ -2977,11 +3074,59 @@ mod preservation_tests {
     }
 
     #[test]
+    fn branch_only_cleanup_ignores_unpushed_worktree_content_and_local_tags() {
+        let (_t, local, remote, remote_s) = fixture();
+        fs::write(
+            local.join("local-secret.txt"),
+            "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n",
+        )
+        .unwrap();
+        cmd(&["git", "-C", local.to_str().unwrap(), "tag", "local-only"]);
+        let mut m = manifest(&local, &remote_s);
+        preserve(&mut m).unwrap();
+        assert_eq!(m.repositories[0].preservation, "blocked");
+        assert_eq!(
+            m.repositories[0]
+                .saved
+                .iter()
+                .filter(|saved| saved.source == "branch")
+                .count(),
+            m.repositories[0].branches.len()
+        );
+        let branch_commit = m.repositories[0]
+            .saved
+            .iter()
+            .find(|saved| saved.source == "branch")
+            .unwrap()
+            .commit
+            .clone();
+        preview(&mut m, true);
+        assert_eq!(m.repositories[0].deletion, "eligible");
+        let state = local.parent().unwrap().join("external-state");
+        fs::create_dir_all(&state).unwrap();
+        cleanup_repository(&m.repositories[0], &remote_s, &state, true).unwrap();
+        assert!(!local.exists());
+        assert!(
+            !cmd(&[
+                "git",
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                &branch_commit,
+            ])
+            .lines()
+            .any(|path| path == "local-secret.txt")
+        );
+    }
+
+    #[test]
     fn cleanup_refuses_changed_branch_after_push() {
         let (_t, local, _remote, remote_s) = fixture();
         let mut m = manifest(&local, &remote_s);
         preserve(&mut m).unwrap();
-        preview(&mut m);
+        preview(&mut m, false);
         cmd(&[
             "git",
             "-C",
@@ -3001,7 +3146,7 @@ mod preservation_tests {
             "late branch",
         ]);
         let state = local.parent().unwrap().join("external-state");
-        assert!(cleanup_repository(&m.repositories[0], &remote_s, &state).is_err());
+        assert!(cleanup_repository(&m.repositories[0], &remote_s, &state, false).is_err());
         assert!(local.exists());
     }
 
@@ -3233,7 +3378,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        preview(&mut manifest);
+        preview(&mut manifest, false);
         assert_eq!(manifest.repositories[0].deletion, "deleted");
     }
 }
