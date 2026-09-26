@@ -79,8 +79,11 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
     let mut counts = BTreeMap::<String, u64>::new();
     let mut contained_oids = BTreeMap::<String, BTreeSet<String>>::new();
     for group in by_tree.values().filter(|group| group.len() > 1) {
-        let group_oids = group.iter().map(|(_, oid)| oid.clone()).collect::<BTreeSet<_>>();
-        for oid in group_oids {
+        let group_oids = group
+            .iter()
+            .map(|(_, oid)| oid.clone())
+            .collect::<BTreeSet<_>>();
+        for oid in &group_oids {
             let output = git_in(
                 Some(&git_dir),
                 [
@@ -166,10 +169,12 @@ pub fn fetch_remote_snapshots(remote: &str) -> Result<Vec<BranchSnapshot>, Strin
 
 fn is_ancestor(git_dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
     let mut command = Command::new("git");
-    command
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant]);
+    command.arg("--git-dir").arg(git_dir).args([
+        "merge-base",
+        "--is-ancestor",
+        ancestor,
+        descendant,
+    ]);
     let output = run(command, None)?;
     match output.status.code() {
         Some(0) => Ok(true),
@@ -550,6 +555,9 @@ mod tests {
         assert_eq!(older.tree_oid, newer.tree_oid);
         assert_eq!(older.commit_count, 2);
         assert_eq!(newer.commit_count, 3);
+        // Commit count is not ancestry evidence: these tips fork from main.
+        assert!(older.contained_by.is_empty());
+        assert!(newer.contained_by.is_empty());
     }
 
     #[test]
@@ -599,5 +607,50 @@ mod tests {
         assert_eq!(snapshots[0].tree_oid, snapshots[1].tree_oid);
         assert_eq!(snapshots[0].commit_count, 1);
         assert_eq!(snapshots[1].commit_count, 1);
+        assert_eq!(
+            snapshots[0].contained_by,
+            [snapshots[1].name.clone()].into()
+        );
+        assert_eq!(
+            snapshots[1].contained_by,
+            [snapshots[0].name.clone()].into()
+        );
+    }
+
+    #[test]
+    fn longer_linear_same_tree_tip_reports_containment() {
+        let fixture = Fixture::new();
+        let base = String::from_utf8(test_git(Some(&fixture.work), ["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        fixture.branch_at_current("topic/short", "short empty commit");
+        test_git(
+            Some(&fixture.work),
+            [
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "longer empty commit",
+            ],
+        );
+        test_git(Some(&fixture.work), ["branch", "topic/long"]);
+        test_git(Some(&fixture.work), ["checkout", "--quiet", base.as_str()]);
+        fixture.publish();
+
+        let snapshots = fetch_remote_snapshots(fixture.remote.to_str().unwrap()).unwrap();
+        let short = snapshots
+            .iter()
+            .find(|branch| branch.name == "topic/short")
+            .unwrap();
+        let long = snapshots
+            .iter()
+            .find(|branch| branch.name == "topic/long")
+            .unwrap();
+        assert_eq!(short.tree_oid, long.tree_oid);
+        assert_eq!(short.commit_count + 1, long.commit_count);
+        assert!(short.contained_by.contains("topic/long"));
+        assert!(!long.contained_by.contains("topic/short"));
     }
 }
