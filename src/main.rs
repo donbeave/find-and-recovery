@@ -3162,6 +3162,29 @@ mod preservation_tests {
     }
 
     #[test]
+    fn isolated_verification_rejects_a_missing_preservation_ref() {
+        let (_t, local, remote, remote_s) = fixture();
+        let mut m = manifest(&local, &remote_s);
+        preserve(&mut m).unwrap();
+        let saved = m.repositories[0]
+            .saved
+            .iter()
+            .find(|saved| saved.source == "branch")
+            .unwrap()
+            .clone();
+        isolated_verify_saved(&remote_s, &saved).unwrap();
+        cmd(&[
+            "git",
+            "--git-dir",
+            remote.to_str().unwrap(),
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{}", saved.remote_ref),
+        ]);
+        assert!(isolated_verify_saved(&remote_s, &saved).is_err());
+    }
+
+    #[test]
     fn gitleaks_finding_blocks_all_uploads() {
         let (_t, local, remote, remote_s) = fixture();
         fs::write(
