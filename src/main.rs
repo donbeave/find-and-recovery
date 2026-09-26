@@ -1138,7 +1138,10 @@ fn scan_lfs_payloads(repo: &Path, records: &[String]) -> Result<(), String> {
         }
         let payload = media.join(&oid[..2]).join(&oid[2..4]).join(oid);
         if !payload.is_file() {
-            return Err(format!("Git LFS payload missing locally: {oid}"));
+            // No local payload means this step cannot upload it. The normal
+            // pre-push hook remains enabled and will fail the branch push if
+            // the server needs bytes that are unavailable here.
+            continue;
         }
         let filename = rest
             .trim_start_matches(['*', '-', ' '])
@@ -1148,7 +1151,9 @@ fn scan_lfs_payloads(repo: &Path, records: &[String]) -> Result<(), String> {
             .unwrap_or("payload");
         let bytes = fs::read(&payload).map_err(|e| e.to_string())?;
         let scan_path = if bytes.starts_with(&[0x1f, 0x8b]) {
-            let expanded = temporary.path().join(format!("{oid}-{}", filename.trim_end_matches(".gz")));
+            let expanded = temporary
+                .path()
+                .join(format!("{oid}-{}", filename.trim_end_matches(".gz")));
             let status = Command::new("gzip")
                 .args(["-dc", payload.to_string_lossy().as_ref()])
                 .output()
@@ -1176,6 +1181,22 @@ fn scan_lfs_payloads(repo: &Path, records: &[String]) -> Result<(), String> {
 }
 
 fn push_lfs_payloads(repo: &Path, remote: &str, records: &[String]) -> Result<(), String> {
+    let env = out(
+        &[
+            "git".into(),
+            "-C".into(),
+            repo.to_string_lossy().into_owned(),
+            "lfs".into(),
+            "env".into(),
+        ],
+        None,
+        &[],
+    )?;
+    let media = env
+        .lines()
+        .find_map(|line| line.strip_prefix("LocalMediaDir="))
+        .map(PathBuf::from)
+        .ok_or("Git LFS did not report LocalMediaDir")?;
     let mut seen = BTreeSet::new();
     for record in records {
         let oid = record
@@ -1183,6 +1204,9 @@ fn push_lfs_payloads(repo: &Path, remote: &str, records: &[String]) -> Result<()
             .next()
             .ok_or("malformed Git LFS inventory entry")?;
         if !seen.insert(oid.to_owned()) {
+            continue;
+        }
+        if !media.join(&oid[..2]).join(&oid[2..4]).join(oid).is_file() {
             continue;
         }
         out(
@@ -1283,16 +1307,30 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         r.preservation = "blocked".into();
         r.saved.clear();
         r.verification_error = None;
-        if !r.inventory_complete {
+        let inventory_only_foreign_worktrees = !r.inventory_errors.is_empty()
+            && r.inventory_errors
+                .iter()
+                .all(|error| error == "foreign registered worktree/dependency");
+        if !r.inventory_complete && !inventory_only_foreign_worktrees {
             r.verification_error = Some("incomplete Git inventory".into());
+            continue;
+        }
+        let unsupported = r.refs.iter().find_map(|entry| {
+            let (name, tail) = entry.split_once(' ')?;
+            let supported = name.starts_with("refs/heads/")
+                || name.starts_with("refs/remotes/")
+                || name == "refs/stash"
+                || (name.starts_with("refs/recovery-local/")
+                    && tail.split_whitespace().nth(1) == Some("commit"));
+            (!supported).then_some(name)
+        });
+        if let Some(reference) = unsupported {
+            r.verification_error =
+                Some(format!("unsupported local ref blocks cleanup: {reference}"));
             continue;
         }
         let path = PathBuf::from(&r.path);
         let remote = m.remote.clone();
-        if !r.alternates.is_empty() {
-            r.verification_error = Some("shared object alternates block cleanup".into());
-            continue;
-        }
         if !r.lfs_files.is_empty() {
             if let Err(error) = scan_lfs_payloads(&path, &r.lfs_files) {
                 r.lfs_preservation = "blocked".into();
@@ -1308,11 +1346,24 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         } else {
             r.lfs_preservation = "not-required".into();
         }
-        if r.worktrees.iter().any(|w| w.foreign_registration) {
-            r.verification_error = Some("missing or foreign registered worktree".into());
-            continue;
-        }
-        let live = inventory_one(&path, r.matched_paths.clone(), &remote);
+        let current_branches = git(
+            &path,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short) %(objectname)",
+                "refs/heads",
+            ],
+        )?
+        .lines()
+        .filter_map(|line| {
+            let (name, commit) = line.split_once(' ')?;
+            Some(Branch {
+                name: name.into(),
+                commit: commit.into(),
+            })
+        })
+        .collect::<Vec<_>>();
+        let current_worktrees = parse_worktrees(&path)?;
         let heads = |items: &[Worktree]| {
             items
                 .iter()
@@ -1327,10 +1378,7 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 })
                 .collect::<BTreeSet<_>>()
         };
-        if !live.inventory_complete
-            || live.branches != r.branches
-            || heads(&live.worktrees) != heads(&r.worktrees)
-        {
+        if current_branches != r.branches || heads(&current_worktrees) != heads(&r.worktrees) {
             r.verification_error =
                 Some("local branches or worktree HEADs changed since scan".into());
             continue;
@@ -1353,10 +1401,37 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 &branch.commit,
                 "branch",
             ) {
-                failure = Some(error);
-                break;
+                failure.get_or_insert(error);
+                continue;
             }
             mapped.insert(branch.commit);
+        }
+        if failure.is_none() {
+            for entry in r.refs.clone() {
+                let Some((name, tail)) = entry.split_once(' ') else {
+                    continue;
+                };
+                if !name.starts_with("refs/recovery-local/") {
+                    continue;
+                }
+                let oid = tail.split_whitespace().next().unwrap_or("");
+                if mapped.contains(oid) {
+                    continue;
+                }
+                if let Err(error) = save_object(
+                    &remote,
+                    &common,
+                    r,
+                    &path,
+                    &format!("recovery-local:{name}"),
+                    oid,
+                    "recovery-local",
+                ) {
+                    failure = Some(error);
+                    break;
+                }
+                mapped.insert(oid.to_owned());
+            }
         }
         if failure.is_none() {
             for (index, stash) in stashes.iter().enumerate() {
@@ -1397,7 +1472,7 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         }
         if failure.is_none() {
             for worktree in worktrees {
-                if worktree.bare {
+                if worktree.bare || worktree.foreign_registration {
                     continue;
                 }
                 if !worktree.ignored.is_empty() {
