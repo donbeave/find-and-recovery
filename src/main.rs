@@ -3166,6 +3166,32 @@ mod tests {
         let oid = commit(d.path(), b"ordinary source\n");
         scan_commit(d.path(), &oid, "").unwrap();
     }
+
+    #[test]
+    fn secret_scan_drains_large_cat_file_batch_without_pipe_deadlock() {
+        let d = repo();
+        for i in 0..7000 {
+            fs::write(d.path().join(format!("object-{i:05}.txt")), b"safe\n").unwrap();
+        }
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(d.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qm", "large batch"])
+                .current_dir(d.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let oid = git(d.path(), &["rev-parse", "HEAD"]).unwrap();
+        scan_commit(d.path(), oid.trim(), "").unwrap();
+    }
     #[test]
     fn secret_scan_accepts_generic_source_variable() {
         let d = repo();
