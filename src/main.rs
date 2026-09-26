@@ -919,6 +919,18 @@ fn load(state: &Path) -> Result<Manifest, String> {
 fn hash_name(s: &str) -> String {
     hash_bytes(s.as_bytes())[..16].into()
 }
+fn temporary_recovery_fixture(path: &Path) -> bool {
+    let temp = fs::canonicalize(env::temp_dir()).unwrap_or_else(|_| env::temp_dir());
+    let candidate = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !candidate.starts_with(&temp) {
+        return false;
+    }
+    candidate
+        .ancestors()
+        .take_while(|ancestor| *ancestor != temp)
+        .filter_map(Path::file_name)
+        .any(|name| name.to_string_lossy().starts_with("recover-"))
+}
 fn recovery_ref(repo: &Repository, source: &str, name: &str, oid: &str) -> String {
     let identity = format!("{source}:{name}");
     let prefix = source
@@ -1307,6 +1319,11 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         r.preservation = "blocked".into();
         r.saved.clear();
         r.verification_error = None;
+        if temporary_recovery_fixture(Path::new(&r.path)) {
+            r.verification_error =
+                Some("ambiguous temporary recovery fixture; retained without upload".into());
+            continue;
+        }
         let inventory_only_foreign_worktrees = !r.inventory_errors.is_empty()
             && r.inventory_errors
                 .iter()
@@ -1785,6 +1802,9 @@ fn same_inventory(expected: &Repository, current: &Repository) -> bool {
             })
 }
 fn cleanup_blocker(r: &Repository) -> Option<String> {
+    if temporary_recovery_fixture(Path::new(&r.path)) {
+        return Some("blocked-temporary-recovery-fixture".into());
+    }
     if !r.inventory_complete {
         return Some("blocked-incomplete-inventory".into());
     }
@@ -2851,6 +2871,14 @@ mod tests {
             b"github_token=ghp_abcdefghijklmnopqrstuvwxyz1234567890\n",
         );
         assert!(scan_commit(d.path(), &oid, "").is_err());
+    }
+
+    #[test]
+    fn temporary_recovery_fixtures_are_retained_without_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = root.path().join("recover-smoke-test").join("repo");
+        fs::create_dir_all(&fixture).unwrap();
+        assert!(temporary_recovery_fixture(&fixture));
     }
 }
 
