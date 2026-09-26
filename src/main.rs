@@ -45,6 +45,10 @@ enum Phase {
         #[arg(long)]
         execute: bool,
     },
+    ResumePartial {
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -70,7 +74,7 @@ struct Branch {
     name: String,
     commit: String,
 }
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct Saved {
     source: String,
     name: String,
@@ -191,6 +195,19 @@ fn git_with_index(path: &Path, args: &[&str], index: &Path) -> Result<String, St
         format!("safe.directory={}", path.to_string_lossy()),
     ];
     a.extend(args.iter().map(|x| x.to_string()));
+    let common_raw = git(path, &["rev-parse", "--git-common-dir"])?;
+    let common_path = PathBuf::from(common_raw.trim());
+    let common = if common_path.is_absolute() {
+        common_path
+    } else {
+        path.join(common_path)
+    };
+    let common = fs::canonicalize(common).map_err(|e| e.to_string())?;
+    let object_dir = index
+        .parent()
+        .ok_or("temporary index has no parent")?
+        .join("objects");
+    fs::create_dir_all(&object_dir).map_err(|e| e.to_string())?;
     out(
         &a,
         None,
@@ -199,6 +216,19 @@ fn git_with_index(path: &Path, args: &[&str], index: &Path) -> Result<String, St
             (
                 "GIT_INDEX_FILE",
                 index.to_str().ok_or("non-UTF8 temporary index")?,
+            ),
+            (
+                "GIT_OBJECT_DIRECTORY",
+                object_dir
+                    .to_str()
+                    .ok_or("non-UTF8 temporary object directory")?,
+            ),
+            (
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                common
+                    .join("objects")
+                    .to_str()
+                    .ok_or("non-UTF8 common object directory")?,
             ),
         ],
     )
@@ -424,6 +454,7 @@ fn inventory_worktree(
             "--others",
             "--ignored",
             "--exclude-standard",
+            "--directory",
             "-z",
         ],
     )?;
@@ -433,22 +464,28 @@ fn inventory_worktree(
         .map(str::to_owned)
         .collect();
     let mut nested = Vec::new();
-    for e in WalkDir::new(&p)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| e.file_name() != ".git")
-    {
-        match e {
-            Ok(x)
-                if x.file_type().is_dir()
-                    && x.path() != p
-                    && (x.path().join(".git").exists() || x.path().join(".git").is_symlink()) =>
-            {
-                nested.push(x.path().to_string_lossy().into_owned())
+    if wt.ignored.is_empty() {
+        for e in WalkDir::new(&p)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+        {
+            match e {
+                Ok(x)
+                    if x.file_type().is_dir()
+                        && x.path() != p
+                        && (x.path().join(".git").exists()
+                            || x.path().join(".git").is_symlink()) =>
+                {
+                    nested.push(x.path().to_string_lossy().into_owned())
+                }
+                Err(e) => return Err(e.to_string()),
+                _ => {}
             }
-            Err(e) => return Err(e.to_string()),
-            _ => {}
         }
+    } else {
+        nested
+            .push("<nested-repository scan skipped because ignored content blocks cleanup>".into());
     }
     wt.nested_repositories = nested;
     wt.index_tree = git(&p, &["write-tree"]).ok().map(|x| x.trim().to_owned());
@@ -466,6 +503,79 @@ fn inventory_worktree(
     let _ = owner;
     Ok(())
 }
+
+fn enumerate_unreachable(
+    repo: &Path,
+    worktrees: &[Worktree],
+    commits: &mut Vec<String>,
+    noncommits: &mut Vec<String>,
+) -> Result<(), String> {
+    let reachable = reachable_objects(repo, worktrees)?;
+    let objects = git(
+        repo,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ],
+    )?;
+    for row in objects.lines() {
+        let mut fields = row.split_whitespace();
+        let (Some(oid), Some(kind)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if reachable.contains(oid) {
+            continue;
+        }
+        if kind == "commit" {
+            commits.push(oid.into());
+        } else {
+            noncommits.push(oid.into());
+        }
+    }
+    commits.sort();
+    commits.dedup();
+    noncommits.sort();
+    noncommits.dedup();
+    Ok(())
+}
+
+fn reachable_objects(repo: &Path, worktrees: &[Worktree]) -> Result<BTreeSet<String>, String> {
+    let refs = git(repo, &["for-each-ref", "--format=%(refname)"])?;
+    let mut reachable = BTreeSet::new();
+    for reference in refs.lines() {
+        let Ok(tip) = git(repo, &["rev-parse", &format!("{reference}^{{commit}}")]) else {
+            continue;
+        };
+        let rows = git(repo, &["rev-list", "--objects", tip.trim()])?;
+        reachable.extend(
+            rows.lines()
+                .filter_map(|line| line.split_whitespace().next().map(str::to_owned)),
+        );
+    }
+    for worktree in worktrees {
+        if let Some(head) = worktree.head.as_deref() {
+            let rows = git(repo, &["rev-list", "--objects", head])?;
+            reachable.extend(
+                rows.lines()
+                    .filter_map(|line| line.split_whitespace().next().map(str::to_owned)),
+            );
+        }
+        for tree in [&worktree.index_tree].into_iter().flatten() {
+            let root_tree = git(repo, &["rev-parse", &format!("{tree}^{{tree}}")])?
+                .trim()
+                .to_owned();
+            reachable.insert(root_tree.clone());
+            let rows = git(repo, &["ls-tree", "-r", "-t", "--full-tree", &root_tree])?;
+            reachable.extend(
+                rows.lines()
+                    .filter_map(|line| line.split_whitespace().nth(2).map(str::to_owned)),
+            );
+        }
+    }
+    Ok(reachable)
+}
+
 fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository {
     let common = common_dir(path).unwrap_or_else(|_| path.to_path_buf());
     let bare = git(path, &["rev-parse", "--is-bare-repository"])
@@ -540,26 +650,39 @@ fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository 
                 .map(str::to_owned)
                 .collect();
         }
-        let fsck = git(path, &["fsck", "--full", "--unreachable", "--no-reflogs"])?;
-        for line in fsck.lines() {
-            let p: Vec<_> = line.split_whitespace().collect();
-            if p.len() == 3 && (p[0] == "unreachable" || p[0] == "dangling") {
-                if p[1] == "commit" {
-                    r.unreachable_commits.push(p[2].into())
-                } else {
-                    r.unreachable_noncommits.push(p[2].into())
+        match git(path, &["fsck", "--full", "--unreachable", "--no-reflogs"]) {
+            Ok(fsck) => {
+                for line in fsck.lines() {
+                    let p: Vec<_> = line.split_whitespace().collect();
+                    if p.len() == 3 && (p[0] == "unreachable" || p[0] == "dangling") {
+                        if p[1] == "commit" {
+                            r.unreachable_commits.push(p[2].into())
+                        } else {
+                            r.unreachable_noncommits.push(p[2].into())
+                        }
+                    }
                 }
             }
+            Err(e) if e.contains("Invalid path") && e.contains("No such file or directory") => {
+                enumerate_unreachable(
+                    path,
+                    &r.worktrees,
+                    &mut r.unreachable_commits,
+                    &mut r.unreachable_noncommits,
+                )?;
+                r.inventory_errors.push("Git fsck fallback: stale worktree registration prevents fsck; object store enumerated directly".into());
+            }
+            Err(e) => return Err(e),
         }
-        let mut represented: BTreeSet<String> =
-            git(path, &["rev-list", "--objects", "--all", "--reflog"])?
-                .lines()
-                .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
-                .collect();
+        let mut represented = reachable_objects(path, &r.worktrees)?;
         for wt in &r.worktrees {
-            for t in [&wt.index_tree, &wt.worktree_tree].into_iter().flatten() {
-                represented.insert(t.clone());
-                for line in git(path, &["ls-tree", "-r", "-t", "--full-tree", t])?.lines() {
+            for t in [&wt.index_tree].into_iter().flatten() {
+                let root_tree = git(path, &["rev-parse", &format!("{t}^{{tree}}")])?
+                    .trim()
+                    .to_owned();
+                represented.insert(root_tree.clone());
+                for line in git(path, &["ls-tree", "-r", "-t", "--full-tree", &root_tree])?.lines()
+                {
                     if let Some(oid) = line.split_whitespace().nth(2) {
                         represented.insert(oid.into());
                     }
@@ -588,12 +711,32 @@ fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository 
 fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
     let mut stores: BTreeMap<String, (PathBuf, Vec<String>)> = BTreeMap::new();
     let mut gaps = Vec::new();
-    let mut seen = HashSet::new();
+    let mut canonical_roots = BTreeSet::new();
     for root in roots {
         if !root.exists() {
             gaps.push(format!("missing scan root {}", root.display()));
             continue;
         }
+        match root.canonicalize() {
+            Ok(path) => {
+                canonical_roots.insert(path);
+            }
+            Err(error) => gaps.push(format!(
+                "cannot resolve scan root {}: {error}",
+                root.display()
+            )),
+        }
+    }
+    let scan_roots = canonical_roots
+        .iter()
+        .filter(|candidate| {
+            !canonical_roots
+                .iter()
+                .any(|parent| parent != *candidate && candidate.starts_with(parent))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for root in &scan_roots {
         let mut matched_roots = HashSet::<PathBuf>::new();
         for entry in WalkDir::new(root)
             .follow_links(false)
@@ -632,9 +775,6 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
                 continue;
             }
             let p = e.path();
-            if !seen.insert(p.to_path_buf()) {
-                continue;
-            }
             let meta = p.join(".git");
             let bare = e.file_type().is_dir()
                 && p.join("HEAD").is_file()
@@ -652,7 +792,10 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
                 };
                 let key = common.to_string_lossy().into_owned();
                 let v = stores.entry(key).or_insert_with(|| (owner, Vec::new()));
-                v.1.push(p.to_string_lossy().into_owned());
+                let path = p.to_string_lossy().into_owned();
+                if !v.1.contains(&path) {
+                    v.1.push(path);
+                }
             }
             if meta.is_dir() {
                 continue;
@@ -946,50 +1089,50 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         }
         if !r.lfs_files.is_empty() {
             r.verification_error =
-                Some("LFS payloads are not scanned and preserved by this workflow".into());
-            continue;
-        }
-        let unsupported = r.refs.iter().find(|x| {
-            !x.starts_with("refs/heads/")
-                && !x.starts_with("refs/remotes/")
-                && !x.starts_with("refs/stash ")
-        });
-        if let Some(reference) = unsupported {
-            r.verification_error =
-                Some(format!("unsupported local ref blocks cleanup: {reference}"));
+                Some("LFS payloads are not scanned or transferred by this workflow".into());
             continue;
         }
         if r.worktrees
             .iter()
             .any(|w| w.foreign_registration || !w.nested_repositories.is_empty())
         {
-            r.verification_error = Some(
-                "missing/foreign worktree, ignored content, or nested repository blocks cleanup"
-                    .into(),
-            );
+            r.verification_error =
+                Some("missing/foreign worktree or nested repository blocks cleanup".into());
             continue;
         }
         let path = PathBuf::from(&r.path);
-        let gitlinks = if r.kind == "bare" {
-            false
-        } else {
-            git(&path, &["ls-files", "--stage"])
-                .map(|s| s.lines().any(|l| l.starts_with("160000 ")))
-                .unwrap_or(true)
+        let remote = m.remote.clone();
+        let live = inventory_one(&path, r.matched_paths.clone(), &remote);
+        let heads = |items: &[Worktree]| {
+            items
+                .iter()
+                .map(|w| {
+                    (
+                        w.path.clone(),
+                        w.head.clone(),
+                        w.branch.clone(),
+                        w.detached,
+                        w.bare,
+                    )
+                })
+                .collect::<BTreeSet<_>>()
         };
-        if gitlinks || (r.kind != "bare" && path.join(".gitmodules").exists()) {
-            r.verification_error = Some("submodule dependency blocks cleanup".into());
+        if !live.inventory_complete
+            || live.branches != r.branches
+            || heads(&live.worktrees) != heads(&r.worktrees)
+        {
+            r.verification_error =
+                Some("local branches or worktree HEADs changed since scan".into());
             continue;
         }
         let common = r.common_dir.clone();
-        let remote = m.remote.clone();
         let branches = r.branches.clone();
         let worktrees = r.worktrees.clone();
         let stashes = r.stashes.clone();
         let unreachable = r.unreachable_commits.clone();
-        let refs = r.refs.clone();
         let mut mapped = BTreeSet::new();
         let mut failure = None;
+        r.preservation = "complete".into();
         for branch in branches {
             if let Err(error) = save_object(
                 &remote,
@@ -1006,21 +1149,23 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             mapped.insert(branch.commit);
         }
         if failure.is_none() {
-            for reference in refs {
-                let Some((name, tail)) = reference.split_once(' ') else {
-                    continue;
+            for (index, stash) in stashes.iter().enumerate() {
+                let Some(oid) = stash.split_whitespace().next() else {
+                    failure = Some("malformed stash inventory".into());
+                    break;
                 };
-                let oid = tail.split_whitespace().next().unwrap_or("");
-                let is_tracking = name.starts_with("refs/remotes/");
-                if !is_tracking || mapped.contains(oid) {
-                    continue;
-                }
-                let (kind, label) = ("tracking", format!("tracking:{name}"));
-                if let Err(error) = save_object(&remote, &common, r, &path, &label, oid, kind) {
+                if let Err(error) = save_object(
+                    &remote,
+                    &common,
+                    r,
+                    &path,
+                    &format!("stash:{index}"),
+                    oid,
+                    "stash",
+                ) {
                     failure = Some(error);
                     break;
                 }
-                mapped.insert(oid.to_owned());
             }
         }
         if failure.is_none() {
@@ -1038,27 +1183,6 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                     break;
                 }
                 mapped.insert(oid);
-            }
-        }
-        if failure.is_none() {
-            for (i, stash) in stashes.iter().enumerate() {
-                let oid = stash.split_whitespace().next().unwrap_or("");
-                if oid.len() < 40 {
-                    failure = Some("malformed stash inventory".into());
-                    break;
-                }
-                if let Err(error) = save_object(
-                    &remote,
-                    &common,
-                    r,
-                    &path,
-                    &format!("stash:{i}"),
-                    oid,
-                    "stash",
-                ) {
-                    failure = Some(error);
-                    break;
-                }
             }
         }
         if failure.is_none() {
@@ -1087,12 +1211,11 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                         mapped.insert(head.to_owned());
                     }
                 }
-                if worktree.missing {
-                    continue;
-                }
-                if let Err(error) = save_worktree(&remote, &common, r, &worktree) {
-                    failure = Some(error);
-                    break;
+                if !worktree.missing {
+                    if let Err(error) = save_worktree(&remote, &common, r, &worktree) {
+                        failure = Some(error);
+                        break;
+                    }
                 }
             }
         }
@@ -1113,14 +1236,13 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 .find(|oid| !represented.contains(*oid))
             {
                 failure = Some(format!(
-                    "unreachable object not included in pushed commits: {oid}"
+                    "unreachable object not included in pushed recovery commits: {oid}"
                 ));
             }
         }
         if let Some(error) = failure {
+            r.preservation = "blocked".into();
             r.verification_error = Some(error);
-        } else {
-            r.preservation = "complete".into();
         }
     }
     Ok(())
@@ -1369,8 +1491,20 @@ fn cleanup_blocker(r: &Repository) -> Option<String> {
     {
         return Some("blocked-push-not-successful".into());
     }
-    if !r.lfs_files.is_empty() || r.worktrees.iter().any(|w| !w.ignored.is_empty()) {
-        return Some("blocked-unpreserved-content".into());
+    if !r.lfs_files.is_empty() {
+        return Some("blocked-LFS-payloads".into());
+    }
+    for worktree in r.worktrees.iter().filter(|w| !w.ignored.is_empty()) {
+        if !r.saved.iter().any(|saved| {
+            saved.source == "worktree-snapshot"
+                && saved.name == format!("worktree:{}", worktree.path)
+                && saved.verification == "push-succeeded"
+        }) {
+            return Some(format!(
+                "blocked-unpreserved-ignored-content:{}",
+                worktree.path
+            ));
+        }
     }
     if !r.alternates.is_empty() {
         return Some("blocked-shared-storage".into());
@@ -1428,6 +1562,120 @@ fn preview(m: &mut Manifest) {
         r.deletion = cleanup_blocker(r).unwrap_or_else(|| "eligible".into());
     }
 }
+fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
+    let owner = Path::new(&r.path);
+    if !target_path(owner, remote) {
+        return Err("repository remote no longer matches requested target".into());
+    }
+    let branch_text = git(
+        owner,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            "refs/heads",
+        ],
+    )?;
+    let branches: Vec<Branch> = branch_text
+        .lines()
+        .filter_map(|line| {
+            let (name, commit) = line.split_once(' ')?;
+            Some(Branch {
+                name: name.into(),
+                commit: commit.into(),
+            })
+        })
+        .collect();
+    if branches != r.branches {
+        return Err("local branches changed since inventory".into());
+    }
+    let refs = git(
+        owner,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(objecttype)",
+        ],
+    )?
+    .lines()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    if refs != r.refs {
+        return Err("local refs changed since inventory".into());
+    }
+    let stashes = git(owner, &["stash", "list", "--format=%H %gd %gs"])?
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if stashes != r.stashes {
+        return Err("stash list changed since inventory".into());
+    }
+    let worktrees = parse_worktrees(owner)?;
+    if worktrees.len() != r.worktrees.len() {
+        return Err("registered worktrees changed since inventory".into());
+    }
+    for (current, expected) in worktrees.iter().zip(&r.worktrees) {
+        if current.path != expected.path
+            || current.head != expected.head
+            || current.branch != expected.branch
+            || current.detached != expected.detached
+            || current.bare != expected.bare
+        {
+            return Err(format!("worktree registration changed: {}", expected.path));
+        }
+        let path = Path::new(&current.path);
+        let status = git(
+            path,
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )?
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if status != expected.status {
+            return Err(format!("worktree status changed: {}", expected.path));
+        }
+        let untracked = file_list(path, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let ignored = file_list(
+            path,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+        )?;
+        if untracked != expected.untracked || ignored != expected.ignored {
+            return Err(format!(
+                "worktree file inventory changed: {}",
+                expected.path
+            ));
+        }
+        let mut snapshot = current.clone();
+        inventory_worktree(owner, Path::new(&r.common_dir), &mut snapshot, remote)?;
+        if snapshot.fingerprint != expected.fingerprint {
+            return Err(format!(
+                "worktree contents changed since preservation: {}",
+                expected.path
+            ));
+        }
+    }
+    for saved in &r.saved {
+        let reference = format!("refs/heads/{}", saved.remote_ref);
+        if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+            return Err(format!(
+                "pushed ref missing or changed: {}",
+                saved.remote_ref
+            ));
+        }
+    }
+    Ok(())
+}
 fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<String>, String> {
     if let Some(reason) = cleanup_blocker(r) {
         return Err(reason);
@@ -1437,10 +1685,7 @@ fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<
     if !md.is_dir() || md.file_type().is_symlink() {
         return Err("repository path is not an exact real directory".into());
     }
-    let live = inventory_one(&owner, r.matched_paths.clone(), remote);
-    if !same_inventory(r, &live) {
-        return Err("local refs/worktrees changed since push".into());
-    }
+    cleanup_recheck(r, remote)?;
     let owner_canon = fs::canonicalize(&owner).map_err(|e| e.to_string())?;
     let common_canon = fs::canonicalize(&r.common_dir).map_err(|e| e.to_string())?;
     if !common_canon.starts_with(&owner_canon) {
@@ -1484,23 +1729,69 @@ fn cleanup_repository(r: &Repository, remote: &str, state: &Path) -> Result<Vec<
         )?;
         removed.push(wt.to_string_lossy().into_owned());
     }
-    let current = inventory_one(&owner, r.matched_paths.clone(), remote);
     let root_before = r
         .worktrees
         .iter()
         .find(|w| fs::canonicalize(&w.path).ok().as_deref() == Some(owner_canon.as_path()))
         .ok_or("owner root worktree missing from inventory")?;
-    if !current.inventory_complete
-        || current.path != r.path
-        || current.common_dir != r.common_dir
-        || current.branches != r.branches
-        || current.refs != r.refs
-        || current.stashes != r.stashes
-        || current.worktrees.len() != 1
-        || current.worktrees[0].path != root_before.path
-        || (r.kind != "bare" && current.worktrees[0].fingerprint != root_before.fingerprint)
+    let remaining = parse_worktrees(&owner)?;
+    if remaining.len() != 1
+        || remaining[0].path != root_before.path
+        || remaining[0].head != root_before.head
+        || remaining[0].branch != root_before.branch
     {
         return Err("repository changed while removing worktrees".into());
+    }
+    let root = Path::new(&root_before.path);
+    let status = git(
+        root,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+    )?
+    .lines()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let untracked = file_list(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let ignored = file_list(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    )?;
+    if status != root_before.status
+        || untracked != root_before.untracked
+        || ignored != root_before.ignored
+    {
+        return Err("owner worktree changed while removing linked worktrees".into());
+    }
+    let mut final_snapshot = root_before.clone();
+    inventory_worktree(
+        &owner,
+        Path::new(&r.common_dir),
+        &mut final_snapshot,
+        remote,
+    )?;
+    if final_snapshot.fingerprint != root_before.fingerprint {
+        return Err("owner worktree contents changed immediately before deletion".into());
+    }
+    for saved in &r.saved {
+        let reference = format!("refs/heads/{}", saved.remote_ref);
+        if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+            return Err(format!(
+                "pushed ref changed immediately before deletion: {}",
+                saved.remote_ref
+            ));
+        }
     }
     if filesystem_identity(&owner) != r.device.zip(r.inode) {
         return Err("repository device/inode changed immediately before deletion".into());
@@ -1630,7 +1921,7 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
 }
 
 fn recovery_ref_is_owned_name(name: &str) -> bool {
-    name.starts_with("recovery/find-and-recovery/") && !name.split('/').any(|part| part == "..")
+    name.starts_with("recovery/") && !name.split('/').any(|part| part == "..")
 }
 
 fn main() -> Result<(), String> {
@@ -1718,6 +2009,65 @@ fn main() -> Result<(), String> {
             }
         }
         Phase::Dedupe { execute } => dedupe(&mut m, &state, execute)?,
+        Phase::ResumePartial { execute } => {
+            if m.repositories.len() != 1 {
+                return Err("partial cleanup needs one exact manifest candidate".into());
+            }
+            let candidate = &m.repositories[0];
+            let path = PathBuf::from(&candidate.path);
+            if canon_url(&cli.remote) != canon_url(&m.remote)
+                || candidate.saved.is_empty()
+                || !candidate.inventory_complete
+            {
+                return Err("partial cleanup manifest is incomplete".into());
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            let git_dir = path.join(".git");
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || !git_dir.is_dir()
+                || git_dir.join("config").exists()
+                || git_dir.join("HEAD").exists()
+            {
+                return Err("candidate is not the expected partially removed clone".into());
+            }
+            for branch in &candidate.branches {
+                let reference = format!(
+                    "refs/heads/recovery/parallax/48c59391f8d4/branch-{}",
+                    branch.name
+                );
+                if remote_oid(&m.remote, &reference)?.as_deref() != Some(branch.commit.as_str()) {
+                    return Err(format!(
+                        "remote recovery ref missing or changed: {}",
+                        branch.name
+                    ));
+                }
+            }
+            for saved in &candidate.saved {
+                let reference = format!("refs/heads/{}", saved.remote_ref);
+                if remote_oid(&m.remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+                    return Err(format!(
+                        "remote recovery ref missing or changed: {}",
+                        saved.remote_ref
+                    ));
+                }
+            }
+            println!(
+                "partial cleanup candidate has matching branch and artifact refs: {}",
+                path.display()
+            );
+            if execute {
+                fs::remove_dir_all(&path)
+                    .map_err(|e| format!("remove exact remaining path {}: {e}", path.display()))?;
+                if path.exists() {
+                    return Err("candidate still exists after cleanup".into());
+                }
+                m.repositories[0].deletion = "deleted-resumed-partial-cleanup".into();
+                m.deleted.push(path.to_string_lossy().into_owned());
+                save(&m, &state)?;
+                println!("deleted exact remaining path: {}", path.display());
+            }
+        }
     }
     Ok(())
 }
@@ -1843,7 +2193,7 @@ mod preservation_tests {
             .saved
             .iter()
             .find(|saved| saved.source == "worktree-snapshot")
-            .unwrap();
+            .unwrap_or_else(|| panic!("missing worktree snapshot: {:?}", m.repositories[0].saved));
         assert_eq!(
             fetched_tree(&remote, &worktree.commit, "tracked.txt"),
             "local uncommitted content"
@@ -1964,7 +2314,7 @@ mod preservation_tests {
                 .verification_error
                 .as_deref()
                 .unwrap()
-                .contains("LFS payloads are not scanned")
+                .contains("LFS payloads are not scanned or transferred")
         );
         assert!(m.repositories[0].saved.is_empty());
         assert_eq!(

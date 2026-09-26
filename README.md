@@ -1,6 +1,6 @@
 # find-and-recovery
 
-Reusable Rust CLI for finding local Git copies by configured repository URL, preserving local branches and worktree snapshots on new recovery refs, and removing only a clone whose recorded pushes succeeded. Git hooks remain enabled on every push so Git LFS pre-push hooks upload payloads.
+Reusable Rust CLI for finding local Git clones, bare repositories, and linked worktrees by remote URL. It pushes each local branch tip and detached worktree HEAD to a new `recovery/` branch. `main`, `master`, and the configured default branch are never pushed over.
 
 ```sh
 cargo run -- --remote https://github.com/OWNER/REPOSITORY scan --roots /Users,/Volumes,/tmp,/private/tmp
@@ -10,10 +10,8 @@ cargo run -- --remote https://github.com/OWNER/REPOSITORY cleanup --execute
 cargo run -- --remote https://github.com/OWNER/REPOSITORY dedupe --execute
 ```
 
-State defaults to `~/.local/share/find-and-recovery`; use `--state PATH` to isolate projects. `scan` records inaccessible paths and coverage gaps in `manifest.json`. Branches named `main`, `master`, or the remote default map only to new recovery refs. Existing remote refs are never overwritten; a collision blocks that item. Gitleaks checks local-only commits and working files before upload.
+State defaults to `~/.local/share/find-and-recovery`; pass `--state PATH` to isolate a run. `scan` records candidate repositories and inaccessible scan paths in `manifest.json`. `preserve` checks local-only commit contents and working files for secrets, then pushes branch tips, detached worktree HEADs, stashes, unreachable commits, and snapshots of staged and working tree content without force. Push collisions and failures block cleanup. Ignored files, LFS payloads, nested repositories, shared storage, and unsupported Git dependencies block cleanup unless the inventory and preservation code explicitly supports them.
 
-Cleanup requires complete inventory and successful pushes for every branch, stash, detached head, and dirty worktree snapshot. It blocks ignored files, nested repositories, LFS payloads that cannot be transferred, shared object stores, and unsupported refs. It rechecks local refs/worktrees immediately before removal, removes linked worktrees first, then removes the exact clone path.
+Cleanup processes repositories serially, rechecks local refs and registered worktrees, removes linked worktrees first, then removes only the exact owning clone path. Shared stores, nested repositories, incomplete inventory, and failed pushes block removal.
 
-After all manifest clones are deleted, `dedupe` compares remote branch tip commit IDs. It can delete only exact duplicate recovery refs created by this run. It keeps one copy when needed and never deletes `main`, `master`, or the advertised default branch. Deletion uses a normal Git ref delete; it does not force-push or overwrite a remote ref.
-
-Run the disposable fixture suite with `cargo test` before use.
+After cleanup, `dedupe` compares remote branch tip commit IDs and can delete only exact duplicate recovery refs created by this run. It protects `main`, `master`, and the advertised default branch; deletion uses regular `git push --delete`, never force. Run the disposable fixture suite with `cargo test` before using the CLI.
