@@ -467,10 +467,36 @@ fn inventory_worktree(
         .collect();
     let mut nested = Vec::new();
     if wt.ignored.is_empty() {
+        let mut skipped = Vec::new();
         for e in WalkDir::new(&p)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| e.file_name() != ".git")
+            .filter_entry(|e| {
+                if e.file_name() == ".git" {
+                    return false;
+                }
+                let name = e.file_name().to_string_lossy();
+                if e.file_type().is_dir()
+                    && [
+                        "target",
+                        "target-review",
+                        "node_modules",
+                        "vendor",
+                        "dist",
+                        "build",
+                        "cache",
+                    ]
+                    .iter()
+                    .any(|excluded| name.eq_ignore_ascii_case(excluded))
+                {
+                    skipped.push(format!(
+                        "<nested-repository scan skipped for generated tree: {}>",
+                        e.path().display()
+                    ));
+                    return false;
+                }
+                true
+            })
         {
             match e {
                 Ok(x)
@@ -485,6 +511,7 @@ fn inventory_worktree(
                 _ => {}
             }
         }
+        nested.extend(skipped);
     } else {
         nested
             .push("<nested-repository scan skipped because ignored content blocks cleanup>".into());
@@ -881,14 +908,22 @@ fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
         )
         .map_err(|e| format!("cannot inspect remote history for secret scanning: {e}"))?
     };
-    let excluded = remote_refs
+    // `ls-remote` can advertise commit IDs absent from this clone (shallow
+    // histories, stale remote refs). `rev-list --not` rejects those IDs, so
+    // exclude only remote commits that are present in this object database.
+    let mut excluded = BTreeSet::new();
+    for oid in remote_refs
         .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .collect::<BTreeSet<_>>();
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        if git(repo, &["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_ok() {
+            excluded.insert(oid.to_owned());
+        }
+    }
     let mut range = oid.to_owned();
     if !excluded.is_empty() {
         range.push_str(" --not ");
-        range.push_str(&excluded.iter().copied().collect::<Vec<_>>().join(" "));
+        range.push_str(&excluded.iter().cloned().collect::<Vec<_>>().join(" "));
     }
     let report = env::temp_dir().join(format!(
         "far-gitleaks-{}-{}.json",
@@ -953,7 +988,14 @@ fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join("\n");
     let mut child = Command::new("git")
-        .args(["-C", repo.to_string_lossy().as_ref(), "cat-file", "--batch"])
+        .args([
+            "-C",
+            repo.to_string_lossy().as_ref(),
+            "-c",
+            &format!("safe.directory={}", repo.to_string_lossy()),
+            "cat-file",
+            "--batch",
+        ])
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1094,12 +1136,8 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 Some("LFS payloads are not scanned or transferred by this workflow".into());
             continue;
         }
-        if r.worktrees
-            .iter()
-            .any(|w| w.foreign_registration || !w.nested_repositories.is_empty())
-        {
-            r.verification_error =
-                Some("missing/foreign worktree or nested repository blocks cleanup".into());
+        if r.worktrees.iter().any(|w| w.foreign_registration) {
+            r.verification_error = Some("missing or foreign registered worktree".into());
             continue;
         }
         let path = PathBuf::from(&r.path);
@@ -1191,6 +1229,13 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             for worktree in worktrees {
                 if worktree.bare {
                     continue;
+                }
+                if !worktree.nested_repositories.is_empty() || !worktree.ignored.is_empty() {
+                    failure = Some(format!(
+                        "worktree has ignored content or nested repositories; snapshot blocked: {}",
+                        worktree.path
+                    ));
+                    break;
                 }
                 if worktree.detached {
                     let Some(head) = worktree.head.as_deref() else {
