@@ -800,7 +800,7 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
                     continue;
                 }
             };
-            if !e.file_type().is_dir() && !e.file_type().is_file() {
+            if !e.file_type().is_dir() {
                 continue;
             }
             let p = e.path();
