@@ -34,6 +34,8 @@ enum Phase {
     Scan {
         #[arg(long, value_delimiter = ',')]
         roots: Vec<PathBuf>,
+        #[arg(long)]
+        root_list: Option<PathBuf>,
     },
     Preserve,
     Preview,
@@ -1940,7 +1942,19 @@ fn main() -> Result<(), String> {
         return Err("manifest remote differs; use separate state".into());
     }
     match cli.command {
-        Phase::Scan { roots } => {
+        Phase::Scan { roots, root_list } => {
+            let mut roots = roots;
+            if let Some(list) = root_list {
+                let contents = fs::read_to_string(&list)
+                    .map_err(|e| format!("read root list {}: {e}", list.display()))?;
+                roots.extend(
+                    contents
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(PathBuf::from),
+                );
+            }
             let roots = if roots.is_empty() {
                 vec![
                     "/".into(),
