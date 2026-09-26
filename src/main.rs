@@ -1287,6 +1287,8 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             r.verification_error = Some("incomplete Git inventory".into());
             continue;
         }
+        let path = PathBuf::from(&r.path);
+        let remote = m.remote.clone();
         if !r.alternates.is_empty() {
             r.verification_error = Some("shared object alternates block cleanup".into());
             continue;
@@ -1297,7 +1299,7 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 r.verification_error = Some(error);
                 continue;
             }
-            if let Err(error) = push_lfs_payloads(&path, &m.remote, &r.lfs_files) {
+            if let Err(error) = push_lfs_payloads(&path, &remote, &r.lfs_files) {
                 r.lfs_preservation = "blocked".into();
                 r.verification_error = Some(error);
                 continue;
@@ -1310,8 +1312,6 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             r.verification_error = Some("missing or foreign registered worktree".into());
             continue;
         }
-        let path = PathBuf::from(&r.path);
-        let remote = m.remote.clone();
         let live = inventory_one(&path, r.matched_paths.clone(), &remote);
         let heads = |items: &[Worktree]| {
             items
@@ -2560,7 +2560,7 @@ mod preservation_tests {
                 .verification_error
                 .as_deref()
                 .unwrap()
-                .contains("LFS payloads are not scanned or transferred")
+                .contains("unsupported Git LFS object ID")
         );
         assert!(m.repositories[0].saved.is_empty());
         assert_eq!(
