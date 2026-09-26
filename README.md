@@ -1,6 +1,6 @@
 # find-and-recovery
 
-Rust CLI for locating local Git copies whose configured remotes match a supplied target, preserving supported local state under recovery refs, verifying recorded remote data, and removing eligible local clones and worktrees.
+Rust CLI for locating local Git copies whose configured remotes match a supplied target, preserving supported local state under recovery refs, verifying recorded remote data, and previewing possible local cleanup.
 
 Preservation writes under `recovery/`. The CLI has no remote branch or repository deletion operation; `dedupe --execute` fails closed. The CLI does not verify repository identity, fork ownership, branch protections, rulesets, or pull request use through GitHub metadata.
 
@@ -51,8 +51,9 @@ jq -e '.coverage_gaps | length == 0' "$STATE/manifest.json" >/dev/null
 run preserve
 run verify
 
-# Review the printed cleanup decisions before the explicit local deletion.
+# Otherwise-eligible candidates show blocked:deletion-boundary.
 run preview
+# Currently exits nonzero and leaves all inventoried local copies in place.
 run cleanup --execute
 ```
 
@@ -60,6 +61,7 @@ If cleanup is interrupted, keep the same manifest, review eligibility again, and
 
 ```sh
 run preview
+# Currently exits nonzero and leaves local copies in place.
 run resume --execute
 ```
 
@@ -67,7 +69,9 @@ run resume --execute
 
 The `jq` check only rejects known scan gaps. It does not prove that the chosen roots cover every local copy. On macOS the defaults include the home directory and common mount/temp paths such as `/Volumes` and `/tmp`; on Linux they include the home directory and common mount/temp paths such as `/mnt`, `/media`, and `/tmp`. `--exhaustive` starts at the filesystem root, but inaccessible locations and traversal errors can still leave gaps. Descendant symlink directories are not followed. Review the intended roots and the entire manifest; a gap-free scan is not proof of whole-machine discovery.
 
-`scan` can exit successfully while listing gaps. Preservation, verification, cleanup, and `dedupe --execute` return nonzero when blocked or incomplete. Cleanup can remove eligible copies already found even when coverage gaps exist, then return an incomplete status; do not execute it until the scope is reviewed and known gaps are resolved. The manifest records candidate-specific inventory, preservation, verification, and deletion statuses.
+`scan` can exit successfully while listing gaps. Preservation, verification, and cleanup return nonzero when blocked or incomplete; `dedupe --execute` always returns nonzero. The manifest records candidate-specific inventory, preservation, verification, and deletion statuses. Preview marks otherwise-eligible repositories `blocked:deletion-boundary`; prior inventory or preservation blockers can still take precedence.
+
+Local cleanup is unavailable. `cleanup --execute` and `resume --execute` currently return nonzero and retain all inventoried local copies, even after successful preservation and verification. This fail-closed gate stays in place until external-writer quiescence, identity-bound quarantine/removal, durable remote retention, shared-store consumer discovery, and a per-operation journal are implemented and proven.
 
 ## Commands and limits
 
@@ -75,8 +79,8 @@ The `jq` check only rejects known scan gaps. It does not prove that the chosen r
 - `refresh --path PATH`: refresh one inventoried repository.
 - `preserve`: scan and push supported recoverable state under recovery refs. `preserve --branches-only` pushes branch tips only and never authorizes cleanup.
 - `verify`: independently fetch and check recorded remote recovery evidence.
-- `preview`: print local cleanup decisions. `preview --branches-only` reports state omitted by branch-only preservation; it does not reduce cleanup requirements.
-- `cleanup --execute` and `resume --execute`: explicitly remove eligible local paths after the common checks. They do not delete remote refs or repositories.
+- `preview`: print local cleanup decisions, including the deletion-boundary blocker. `preview --branches-only` reports state omitted by branch-only preservation; it does not reduce cleanup requirements.
+- `cleanup --execute` and `resume --execute`: request local cleanup, but currently fail closed at the deletion boundary and retain local copies. They do not delete remote refs or repositories.
 - `dedupe [--json]`: read remote branch history and preview the branch plan. `dedupe --all-unprotected` broadens preview scope only; protection and pull request facts are not checked. `dedupe --execute` always fails closed before remote access.
 - `record-recovered-deletion --path ABSOLUTE_PATH --ref-prefix HEX`: rebuild a local deletion-history entry from known manifest history and matching remote recovery refs. It does not restore a repository.
 
@@ -86,4 +90,4 @@ Candidate matching currently uses configured Git remote URLs and branch upstream
 
 Secret-scan failures block uploads. Unsupported refs or objects, unresolved shared storage, ignored or uncertain local content, incomplete worktree registrations, changed state, and unavailable or unverifiable LFS payloads can block cleanup. Preserve only sends data after its supported secret checks; do not treat scanner success as a secret-free guarantee.
 
-There is no standalone restore command or remote recovery index. The local manifest contains source-to-recovery mappings; keep it with the recovery refs until a tested restore workflow exists. Remote verification proves the recorded data at verification time and does not prevent later changes by external actors.
+There is no product restore command or remote recovery index. The integration test includes a manual remote-only reconstruction: it removes disposable fixture clones and the fixture manifest, then uses ordinary `git clone --no-local` and `git fetch` commands to inspect recovery refs. That test demonstrates one fixture path; it is not a restore workflow exposed by this CLI. Keep the local manifest with the recovery refs. Remote verification proves the recorded data at verification time and does not prevent later changes by external actors.
