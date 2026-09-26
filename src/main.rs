@@ -2025,7 +2025,12 @@ fn cleanup_blocker(r: &Repository) -> Option<String> {
     None
 }
 fn preview(m: &mut Manifest) {
+    let deleted = m.deleted.iter().cloned().collect::<BTreeSet<_>>();
     for r in &mut m.repositories {
+        if deleted.contains(&r.path) && !Path::new(&r.path).exists() {
+            r.deletion = "deleted".into();
+            continue;
+        }
         r.deletion = cleanup_blocker(r).unwrap_or_else(|| "eligible".into());
     }
 }
@@ -3110,6 +3115,27 @@ mod tests {
         let fixture = root.path().join("recover-smoke-test").join("repo");
         fs::create_dir_all(&fixture).unwrap();
         assert!(temporary_recovery_fixture(&fixture));
+    }
+
+    #[test]
+    fn preview_keeps_deleted_path_state_after_directory_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join("removed-clone")
+            .to_string_lossy()
+            .into_owned();
+        let mut manifest = Manifest {
+            deleted: vec![path.clone()],
+            repositories: vec![Repository {
+                path: path.clone(),
+                deletion: "deleted".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        preview(&mut manifest);
+        assert_eq!(manifest.repositories[0].deletion, "deleted");
     }
 }
 
