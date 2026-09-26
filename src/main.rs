@@ -815,6 +815,25 @@ fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository 
     }
     r
 }
+fn branch_inventory(path: &Path) -> Result<Vec<Branch>, String> {
+    Ok(git(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+        ],
+    )?
+    .lines()
+    .filter_map(|line| {
+        let (reference, commit) = line.split_once(' ')?;
+        Some(Branch {
+            name: reference.strip_prefix("refs/heads/")?.into(),
+            commit: commit.into(),
+        })
+    })
+    .collect())
+}
 fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
     let mut stores: BTreeMap<String, (PathBuf, Vec<String>)> = BTreeMap::new();
     let mut gaps = Vec::new();
@@ -1452,23 +1471,7 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
         } else {
             r.lfs_preservation = "not-required".into();
         }
-        let current_branches = git(
-            &path,
-            &[
-                "for-each-ref",
-                "--format=%(refname:short) %(objectname)",
-                "refs/heads",
-            ],
-        )?
-        .lines()
-        .filter_map(|line| {
-            let (name, commit) = line.split_once(' ')?;
-            Some(Branch {
-                name: name.into(),
-                commit: commit.into(),
-            })
-        })
-        .collect::<Vec<_>>();
+        let current_branches = branch_inventory(&path)?;
         let current_worktrees = parse_worktrees(&path)?;
         let heads = |items: &[Worktree]| {
             items
@@ -2031,24 +2034,7 @@ fn cleanup_recheck(r: &Repository, remote: &str) -> Result<(), String> {
     if !target_path(owner, remote) {
         return Err("repository remote no longer matches requested target".into());
     }
-    let branch_text = git(
-        owner,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short) %(objectname)",
-            "refs/heads",
-        ],
-    )?;
-    let branches: Vec<Branch> = branch_text
-        .lines()
-        .filter_map(|line| {
-            let (name, commit) = line.split_once(' ')?;
-            Some(Branch {
-                name: name.into(),
-                commit: commit.into(),
-            })
-        })
-        .collect();
+    let branches = branch_inventory(owner)?;
     if branches != r.branches {
         return Err("local branches changed since inventory".into());
     }
@@ -3031,6 +3017,18 @@ mod preservation_tests {
                 .iter()
                 .any(|saved| saved.name == "branch:later")
         );
+    }
+
+    #[test]
+    fn branch_inventory_keeps_exact_names_when_tags_are_ambiguous() {
+        let (_temp, local, _remote, _remote_url) = fixture();
+        cmd(&["git", "-C", local.to_str().unwrap(), "tag", "main"]);
+        let names: Vec<_> = branch_inventory(&local)
+            .unwrap()
+            .into_iter()
+            .map(|branch| branch.name)
+            .collect();
+        assert_eq!(names, ["main"]);
     }
 }
 
