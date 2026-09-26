@@ -12,6 +12,7 @@ use std::{
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
@@ -36,6 +37,10 @@ enum Phase {
         roots: Vec<PathBuf>,
         #[arg(long)]
         root_list: Option<PathBuf>,
+    },
+    Refresh {
+        #[arg(long)]
+        path: PathBuf,
     },
     Preserve,
     Preview,
@@ -983,31 +988,97 @@ fn sensitive_re(repo: &Path) -> Regex {
     // in source code are common and otherwise block clean history.
     Regex::new(r#"(?i)(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b)"#).unwrap()
 }
+static SECRET_SCAN_CACHE: OnceLock<Mutex<BTreeMap<String, Result<(), String>>>> = OnceLock::new();
+static REMOTE_REF_CACHE: OnceLock<Mutex<BTreeMap<String, Result<String, String>>>> =
+    OnceLock::new();
+static REMOTE_COMMIT_CACHE: OnceLock<Mutex<BTreeMap<String, Result<BTreeSet<String>, String>>>> =
+    OnceLock::new();
+
 fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
+    let cache_key = format!(
+        "{}\0{remote}\0{oid}",
+        repo.canonicalize()
+            .unwrap_or_else(|_| repo.to_path_buf())
+            .display()
+    );
+    let cache = SECRET_SCAN_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some(result) = cache.lock().map_err(|e| e.to_string())?.get(&cache_key) {
+        return result.clone();
+    }
+    let result = scan_commit_uncached(repo, oid, remote);
+    cache
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(cache_key, result.clone());
+    result
+}
+
+fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
     // Run the maintained scanner against the exact commit ancestry before any
     // object upload. Never persist scanner output or print a finding.
     let remote_refs = if remote.is_empty() {
         String::new()
     } else {
-        out(
-            &["git".into(), "ls-remote".into(), remote.into()],
-            None,
-            &[],
-        )
-        .map_err(|e| format!("cannot inspect remote history for secret scanning: {e}"))?
+        let cache = REMOTE_REF_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+        if let Some(value) = cache
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(remote)
+            .cloned()
+        {
+            value.map_err(|e| format!("cannot inspect remote history for secret scanning: {e}"))?
+        } else {
+            let value = out(
+                &["git".into(), "ls-remote".into(), remote.into()],
+                None,
+                &[],
+            )
+            .map_err(|e| format!("cannot inspect remote history for secret scanning: {e}"));
+            cache
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(remote.to_owned(), value.clone());
+            value?
+        }
     };
     // `ls-remote` can advertise commit IDs absent from this clone (shallow
     // histories, stale remote refs). `rev-list --not` rejects those IDs, so
     // exclude only remote commits that are present in this object database.
-    let mut excluded = BTreeSet::new();
-    for oid in remote_refs
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
+    let excluded_key = format!(
+        "{}\0{remote}",
+        repo.canonicalize()
+            .unwrap_or_else(|_| repo.to_path_buf())
+            .display()
+    );
+    let commit_cache = REMOTE_COMMIT_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut excluded = if let Some(value) = commit_cache
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&excluded_key)
+        .cloned()
     {
-        if git(repo, &["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_ok() {
-            excluded.insert(oid.to_owned());
+        value?
+    } else {
+        let mut found = BTreeSet::new();
+        for remote_oid in remote_refs
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+        {
+            if git(
+                repo,
+                &["cat-file", "-e", &format!("{remote_oid}^{{commit}}")],
+            )
+            .is_ok()
+            {
+                found.insert(remote_oid.to_owned());
+            }
         }
-    }
+        commit_cache
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(excluded_key, Ok(found.clone()));
+        found
+    };
     let mut range = oid.to_owned();
     if !excluded.is_empty() {
         range.push_str(" --not ");
@@ -1333,6 +1404,9 @@ fn push_ref(remote: &str, repo: &Path, oid: &str, reference: &str) -> Result<boo
 }
 fn preserve(m: &mut Manifest) -> Result<(), String> {
     for r in &mut m.repositories {
+        if r.deletion == "deleted" && !Path::new(&r.path).exists() {
+            continue;
+        }
         let prior_saved = r.saved.clone();
         r.preservation = "blocked".into();
         r.saved.clear();
@@ -1584,7 +1658,34 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 saved.created_by_this_run = true;
             }
         }
+        for previous in prior_saved {
+            if !r.saved.iter().any(|saved| {
+                saved.remote_ref == previous.remote_ref && saved.commit == previous.commit
+            }) {
+                r.saved.push(previous);
+            }
+        }
     }
+    Ok(())
+}
+
+fn refresh_repository(m: &mut Manifest, requested_path: &Path) -> Result<(), String> {
+    let requested_common = common_dir(requested_path)?.to_string_lossy().into_owned();
+    let index = m.repositories.iter().position(|repo| repo.common_dir == requested_common)
+        .ok_or_else(|| format!("repository not present in manifest: {}", requested_path.display()))?;
+    let previous = m.repositories[index].clone();
+    let owner = if Path::new(&requested_common).file_name().is_some_and(|name| name == ".git") {
+        Path::new(&requested_common).parent().ok_or("invalid common Git directory")?.to_path_buf()
+    } else {
+        requested_path.to_path_buf()
+    };
+    let mut refreshed = inventory_one(&owner, previous.matched_paths.clone(), &m.remote);
+    if !refreshed.inventory_complete {
+        return Err(format!("refreshed inventory incomplete: {}", refreshed.inventory_errors.join("; ")));
+    }
+    refreshed.saved = previous.saved;
+    m.repositories[index] = refreshed;
+    m.generated_unix = now();
     Ok(())
 }
 
