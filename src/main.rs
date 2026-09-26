@@ -91,12 +91,12 @@ struct Worktree {
     worktree_tree: Option<String>,
     fingerprint: String,
 }
-#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct Branch {
     name: String,
     commit: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct Saved {
     source: String,
     name: String,
@@ -142,6 +142,15 @@ struct Repository {
     verification_error: Option<String>,
     deletion: String,
 }
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct DeletionRecord {
+    local_path: String,
+    common_dir: String,
+    local_branches: Vec<Branch>,
+    snapshots: Vec<Saved>,
+    removed_paths: Vec<String>,
+    completed_unix: u64,
+}
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
     schema_version: u32,
@@ -154,14 +163,96 @@ struct Manifest {
     /// which replaces the repository inventory and otherwise drops saved refs.
     #[serde(default)]
     recovery_ownership: Vec<Saved>,
+    /// Durable local-path-to-recovery-ref mappings for copies already removed.
+    #[serde(default)]
+    deletion_history: Vec<DeletionRecord>,
     deleted: Vec<String>,
+}
+
+fn record_deleted_copy(manifest: &mut Manifest, repository: &Repository, removed_paths: &[String]) {
+    let record = DeletionRecord {
+        local_path: repository.path.clone(),
+        common_dir: repository.common_dir.clone(),
+        local_branches: repository.branches.clone(),
+        snapshots: repository.saved.clone(),
+        removed_paths: removed_paths.to_vec(),
+        completed_unix: now(),
+    };
+    if !manifest.deletion_history.iter().any(|previous| {
+        previous.local_path == record.local_path
+            && previous.common_dir == record.common_dir
+            && previous.snapshots == record.snapshots
+            && previous.removed_paths == record.removed_paths
+    }) {
+        manifest.deletion_history.push(record);
+    }
+    for path in removed_paths {
+        if !manifest.deleted.contains(path) {
+            manifest.deleted.push(path.clone());
+        }
+    }
+}
+
+fn merge_deletion_history(target: &mut Manifest, previous: &Manifest) {
+    target.deleted = previous.deleted.clone();
+    for record in &previous.deletion_history {
+        if !target.deletion_history.iter().any(|existing| {
+            existing.local_path == record.local_path
+                && existing.common_dir == record.common_dir
+                && existing.completed_unix == record.completed_unix
+        }) {
+            target.deletion_history.push(record.clone());
+        }
+    }
+    // Upgrade manifests written before deletion_history existed. The old
+    // repository row still contains the branch/snapshot mapping and path.
+    for repository in &previous.repositories {
+        if !repository.deletion.starts_with("deleted")
+            || target.deletion_history.iter().any(|record| {
+                record.local_path == repository.path && record.snapshots == repository.saved
+            })
+        {
+            continue;
+        }
+        let removed_paths = previous
+            .deleted
+            .iter()
+            .filter(|path| {
+                *path == &repository.path
+                    || repository
+                        .worktrees
+                        .iter()
+                        .any(|worktree| &worktree.path == *path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        target.deletion_history.push(DeletionRecord {
+            local_path: repository.path.clone(),
+            common_dir: repository.common_dir.clone(),
+            local_branches: repository.branches.clone(),
+            snapshots: repository.saved.clone(),
+            removed_paths: if removed_paths.is_empty() {
+                vec![repository.path.clone()]
+            } else {
+                removed_paths
+            },
+            completed_unix: previous.generated_unix,
+        });
+    }
 }
 
 fn merge_recovery_ownership(target: &mut Manifest, previous: &Manifest) {
     let mut seen = target
         .recovery_ownership
         .iter()
-        .map(|saved| (saved.remote_ref.clone(), saved.commit.clone()))
+        .map(|saved| {
+            (
+                saved.remote_ref.clone(),
+                saved.commit.clone(),
+                saved.source.clone(),
+                saved.name.clone(),
+            )
+        })
         .collect::<BTreeSet<_>>();
     for saved in previous.recovery_ownership.iter().chain(
         previous
@@ -169,13 +260,16 @@ fn merge_recovery_ownership(target: &mut Manifest, previous: &Manifest) {
             .iter()
             .flat_map(|repo| repo.saved.iter()),
     ) {
-        // A persisted branch mapping is the ownership evidence. The remote
-        // OID is checked again at dedupe time; namespace alone never grants
-        // ownership. Keep legacy records even when `created_by_this_run` is
-        // false: that bit means this invocation did not create the ref.
-        if saved.source == "branch"
-            && saved.remote_ref.starts_with("recovery/find-and-recovery/")
-            && seen.insert((saved.remote_ref.clone(), saved.commit.clone()))
+        // Keep every saved recovery mapping across a fresh scan. Dedupe still
+        // selects only branch records and checks their exact remote OID; these
+        // non-branch mappings preserve the audit trail for local snapshots.
+        if saved.remote_ref.starts_with("recovery/")
+            && seen.insert((
+                saved.remote_ref.clone(),
+                saved.commit.clone(),
+                saved.source.clone(),
+                saved.name.clone(),
+            ))
         {
             target.recovery_ownership.push(saved.clone());
         }
@@ -3435,6 +3529,7 @@ fn main() -> Result<(), String> {
     };
     if let Some(previous) = &previous_scan_manifest {
         merge_recovery_ownership(&mut m, previous);
+        merge_deletion_history(&mut m, previous);
     }
     if canon_url(&cli.remote) != canon_url(&m.remote) {
         return Err("manifest remote differs; use separate state".into());
@@ -3559,7 +3654,8 @@ fn main() -> Result<(), String> {
                     match cleanup_repository(&m.repositories[i], &m.remote, &state, false) {
                         Ok(paths) => {
                             m.repositories[i].deletion = "deleted".into();
-                            m.deleted.extend(paths);
+                            let repository = m.repositories[i].clone();
+                            record_deleted_copy(&mut m, &repository, &paths);
                         }
                         Err(e) => {
                             m.repositories[i].deletion = format!("blocked:{e}");
@@ -3626,7 +3722,8 @@ fn main() -> Result<(), String> {
                     return Err("candidate still exists after cleanup".into());
                 }
                 m.repositories[0].deletion = "deleted-resumed-partial-cleanup".into();
-                m.deleted.push(path.to_string_lossy().into_owned());
+                let repository = m.repositories[0].clone();
+                record_deleted_copy(&mut m, &repository, &[path.to_string_lossy().into_owned()]);
                 save(&m, &state)?;
                 println!("deleted exact remaining path: {}", path.display());
             }
@@ -4348,12 +4445,77 @@ mod tests {
 
         merge_recovery_ownership(&mut fresh_scan, &previous);
 
-        assert_eq!(fresh_scan.recovery_ownership.len(), 1);
+        assert_eq!(fresh_scan.recovery_ownership.len(), 7);
         assert_eq!(
             fresh_scan.recovery_ownership[0].remote_ref,
             "recovery/find-and-recovery/old/branch-a"
         );
         assert!(!fresh_scan.recovery_ownership[0].created_by_this_run);
+        for source in [
+            "branch",
+            "worktree-snapshot",
+            "staged",
+            "stash",
+            "unreachable",
+            "local-tag-objects",
+            "lfs",
+        ] {
+            assert!(
+                fresh_scan
+                    .recovery_ownership
+                    .iter()
+                    .any(|saved| saved.source == source)
+            );
+        }
+        assert!(
+            !fresh_scan
+                .recovery_ownership
+                .iter()
+                .any(|saved| saved.remote_ref == "topic/unowned")
+        );
+    }
+
+    #[test]
+    fn fresh_scan_carries_deleted_copy_snapshot_mapping() {
+        let path = "/projects/removed-clone".to_owned();
+        let recovery = Saved {
+            source: "branch".into(),
+            name: "branch:main".into(),
+            commit: "a".repeat(40),
+            remote_ref: "recovery/find-and-recovery/b9064771/branch-main".into(),
+            verification: "push-succeeded".into(),
+            ..Default::default()
+        };
+        let previous = Manifest {
+            generated_unix: 123,
+            deleted: vec![path.clone()],
+            repositories: vec![Repository {
+                path: path.clone(),
+                common_dir: format!("{path}/.git"),
+                branches: vec![Branch {
+                    name: "main".into(),
+                    commit: recovery.commit.clone(),
+                }],
+                saved: vec![recovery.clone()],
+                deletion: "deleted".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut fresh_scan = Manifest::default();
+
+        merge_deletion_history(&mut fresh_scan, &previous);
+
+        assert_eq!(fresh_scan.deleted, [path.as_str()]);
+        assert_eq!(fresh_scan.deletion_history.len(), 1);
+        let record = &fresh_scan.deletion_history[0];
+        assert_eq!(record.local_path, path);
+        assert_eq!(record.local_branches[0].name, "main");
+        assert_eq!(record.local_branches[0].commit, recovery.commit);
+        assert_eq!(record.snapshots[0].remote_ref, recovery.remote_ref);
+        assert_eq!(record.snapshots[0].commit, recovery.commit);
+        assert_eq!(record.removed_paths, ["/projects/removed-clone"]);
+        assert_eq!(record.completed_unix, 123);
     }
 
     fn repo() -> tempfile::TempDir {
