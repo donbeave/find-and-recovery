@@ -805,26 +805,32 @@ fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository 
         }
         r.unreachable_noncommits
             .retain(|oid| !represented.contains(oid));
-        let mut lfs_commits = r
+        let ref_heads = r
             .refs
             .iter()
-            .filter_map(|entry| entry.split_whitespace().next())
-            .filter_map(|reference| {
-                git(path, &["rev-parse", &format!("{reference}^{{commit}}")])
-                    .ok()
-                    .map(|oid| oid.trim().to_owned())
+            .filter_map(|entry| {
+                let mut fields = entry.split_whitespace();
+                let _reference = fields.next()?;
+                let oid = fields.next()?;
+                (fields.next()? == "commit").then(|| oid.to_owned())
             })
             .collect::<BTreeSet<_>>();
-        lfs_commits.extend(
-            r.worktrees
-                .iter()
-                .filter_map(|worktree| worktree.head.clone()),
-        );
-        let mut lfs_files = BTreeSet::new();
-        for commit in lfs_commits {
-            let files = git(path, &["lfs", "ls-files", "--long", &commit])
-                .map_err(|error| format!("could not inventory LFS payloads: {error}"))?;
-            lfs_files.extend(files.lines().map(str::to_owned));
+        let mut lfs_files = git(path, &["lfs", "ls-files", "--all", "--long"])
+            .map_err(|error| format!("could not inventory LFS payloads: {error}"))?
+            .lines()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        for head in r
+            .worktrees
+            .iter()
+            .filter_map(|worktree| worktree.head.as_deref())
+        {
+            if !ref_heads.contains(head) {
+                let files = git(path, &["lfs", "ls-files", "--long", head]).map_err(|error| {
+                    format!("could not inventory detached LFS payloads: {error}")
+                })?;
+                lfs_files.extend(files.lines().map(str::to_owned));
+            }
         }
         r.lfs_files = lfs_files.into_iter().collect();
         Ok(())
@@ -894,17 +900,58 @@ fn discover(
     for root in &scan_roots {
         eprintln!("discovery: walking {}", root.display());
         let mut matched_roots = HashSet::<PathBuf>::new();
+        let root_skips = std::cell::RefCell::new(Vec::new());
+        let visited = std::cell::Cell::new(0usize);
         for entry in WalkDir::new(root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
+                let count = visited.get() + 1;
+                visited.set(count);
+                if count % 100_000 == 0 {
+                    eprintln!("discovery: {} entries under {}", count, root.display());
+                }
                 if e.file_name() == ".git" {
                     return false;
                 }
-                let p = e.path();
-                if matched_roots
+                if !e.file_type().is_dir() {
+                    return true;
+                }
+                if e.file_type().is_dir() {
+                    let name = e.file_name().to_string_lossy();
+                    if [
+                        "node_modules",
+                        "target",
+                        "target-review",
+                        "vendor",
+                        "dist",
+                        "build",
+                        ".cache",
+                        "Caches",
+                        "DerivedData",
+                        "Pods",
+                        ".gradle",
+                        ".m2",
+                        ".rustup",
+                        ".npm",
+                        ".yarn",
+                        ".velnor-store",
+                        "registry",
+                    ]
                     .iter()
-                    .any(|root| p != root && p.starts_with(root))
+                    .any(|excluded| name.eq_ignore_ascii_case(excluded))
+                    {
+                        root_skips.borrow_mut().push(format!(
+                            "generated/cache directory not traversed: {}",
+                            e.path().display()
+                        ));
+                        return false;
+                    }
+                }
+                let p = e.path();
+                if p.ancestors()
+                    .skip(1)
+                    .any(|ancestor| matched_roots.contains(ancestor))
                 {
                     return false;
                 }
@@ -966,6 +1013,7 @@ fn discover(
                 continue;
             }
         }
+        gaps.extend(root_skips.into_inner());
         eprintln!("discovery: finished {}", root.display());
     }
     let mut repos = Vec::new();
@@ -2326,23 +2374,25 @@ fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
             return Some(format!("blocked-unpushed-branch:{}", b.name));
         }
     }
-    for w in &r.worktrees {
-        if w.detached
-            && !r
-                .branches
-                .iter()
-                .any(|b| Some(&b.commit) == w.head.as_ref())
-        {
-            let Some(head) = w.head.as_ref() else {
-                return Some("blocked-detached-head-missing".into());
-            };
-            if !r.saved.iter().any(|s| {
-                s.source == "detached"
-                    && s.name == format!("detached:{}", w.path)
-                    && &s.commit == head
-                    && s.verification == "isolated-verified"
-            }) {
-                return Some(format!("blocked-unpushed-detached-head:{}", w.path));
+    if !branches_only {
+        for w in &r.worktrees {
+            if w.detached
+                && !r
+                    .branches
+                    .iter()
+                    .any(|b| Some(&b.commit) == w.head.as_ref())
+            {
+                let Some(head) = w.head.as_ref() else {
+                    return Some("blocked-detached-head-missing".into());
+                };
+                if !r.saved.iter().any(|s| {
+                    s.source == "detached"
+                        && s.name == format!("detached:{}", w.path)
+                        && &s.commit == head
+                        && s.verification == "isolated-verified"
+                }) {
+                    return Some(format!("blocked-unpushed-detached-head:{}", w.path));
+                }
             }
         }
     }
@@ -2377,25 +2427,50 @@ fn cleanup_recheck_branches(r: &Repository, remote: &str) -> Result<(), String> 
     if branch_inventory(owner)? != r.branches {
         return Err("local branches changed since inventory".into());
     }
-    let current = parse_worktrees(owner)?;
-    if current.len() != r.worktrees.len()
-        || current.iter().zip(&r.worktrees).any(|(now, expected)| {
-            now.path != expected.path
-                || now.head != expected.head
-                || now.branch != expected.branch
-                || now.detached != expected.detached
-                || now.bare != expected.bare
-                || now.missing != expected.missing
-        })
-    {
-        return Err("registered worktrees changed since inventory".into());
+    let mut current = parse_worktrees(owner)?;
+    let mut expected = r.worktrees.clone();
+    current.sort_by(|a, b| a.path.cmp(&b.path));
+    expected.sort_by(|a, b| a.path.cmp(&b.path));
+    if current.len() != expected.len() {
+        return Err(format!(
+            "registered worktrees changed since inventory: expected {}, found {}",
+            expected.len(),
+            current.len()
+        ));
+    }
+    if let Some((now, expected)) = current.iter().zip(&expected).find(|(now, expected)| {
+        now.path != expected.path
+            || now.head != expected.head
+            || now.branch != expected.branch
+            || now.detached != expected.detached
+            || now.bare != expected.bare
+            || (now.missing != expected.missing
+                && !(expected.missing && !Path::new(&expected.path).exists()))
+    }) {
+        return Err(format!(
+            "registered worktrees changed since inventory at {} (current head {:?}, branch {:?}, missing {}; expected head {:?}, branch {:?}, missing {})",
+            now.path,
+            now.head,
+            now.branch,
+            now.missing,
+            expected.head,
+            expected.branch,
+            expected.missing
+        ));
     }
     for saved in branch_saved(r) {
-        let reference = format!("refs/heads/{}", saved.remote_ref);
-        if remote_oid(remote, &reference)?.as_deref() != Some(saved.commit.as_str()) {
+        if !saved_commit_is_preserved(remote, saved)? {
             return Err(format!(
                 "pushed branch ref missing or changed: {}",
                 saved.remote_ref
+            ));
+        }
+    }
+    for saved in r.saved.iter().filter(|saved| saved.source == "detached") {
+        if !saved_commit_is_preserved(remote, saved)? {
+            return Err(format!(
+                "detached HEAD commit no longer has a remote branch: {}",
+                saved.name
             ));
         }
     }
@@ -2551,8 +2626,10 @@ fn cleanup_repository(
     if let Some(reason) = cleanup_blocker(r, branches_only) {
         return Err(reason);
     }
-    for saved in &r.saved {
-        isolated_verify_saved(remote, saved)?;
+    if !branches_only {
+        for saved in &r.saved {
+            isolated_verify_saved(remote, saved)?;
+        }
     }
     let owner = PathBuf::from(&r.path);
     let md = fs::symlink_metadata(&owner).map_err(|e| e.to_string())?;
@@ -2582,6 +2659,12 @@ fn cleanup_repository(
     let mut worktrees: Vec<PathBuf> = r.worktrees.iter().map(|w| PathBuf::from(&w.path)).collect();
     worktrees.sort_by_key(|p| (p == &owner, p.clone()));
     let mut removed = Vec::new();
+    // Missing worktree paths have no working files to remove, but stale Git
+    // administrative records prevent the final owner-only check. Prune those
+    // records after confirming inventory and remote branch state above.
+    if r.worktrees.iter().any(|w| w.missing) {
+        git(&owner, &["worktree", "prune"])?;
+    }
     for wt in worktrees {
         if wt == owner {
             continue;
@@ -2759,25 +2842,6 @@ fn cleanup_repository(
 fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
     let remote = m.remote.clone();
     reject_remote_url_rewrite(&remote, None)?;
-    for repo in &m.repositories {
-        if temporary_recovery_fixture(Path::new(&repo.path)) {
-            continue;
-        }
-        for branch in &repo.branches {
-            let pushed = repo.saved.iter().any(|saved| {
-                saved.source == "branch"
-                    && saved.name == format!("branch:{}", branch.name)
-                    && saved.commit == branch.commit
-                    && saved.verification == "push-succeeded"
-            });
-            if !pushed {
-                return Err(format!(
-                    "dedupe blocked; local branch not recorded as pushed: {} ({})",
-                    branch.name, repo.path
-                ));
-            }
-        }
-    }
     let push_context = tempfile::Builder::new()
         .prefix("find-and-recovery-dedupe-")
         .tempdir()
@@ -2834,7 +2898,7 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
     let mut branch_oids = BTreeMap::new();
     let branches = heads
         .lines()
-        .map(|line| -> Result<dedupe::RemoteBranch, String> {
+        .map(|line| -> Result<dedupe::BranchSnapshot, String> {
             let (oid, full_name) = line.split_once('\t').ok_or("malformed ls-remote row")?;
             let name = full_name
                 .strip_prefix("refs/heads/")
@@ -2857,9 +2921,39 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
                 return Err(format!("remote branch changed during scan: {name}"));
             }
             branch_oids.insert(name.clone(), oid.to_owned());
-            Ok(dedupe::RemoteBranch {
+            let tree_oid = out(
+                &[
+                    "git".into(),
+                    "-C".into(),
+                    push_context.path().to_string_lossy().into_owned(),
+                    "rev-parse".into(),
+                    format!("{oid}^{{tree}}"),
+                ],
+                None,
+                &[],
+            )?
+            .trim()
+            .to_owned();
+            let commit_count = out(
+                &[
+                    "git".into(),
+                    "-C".into(),
+                    push_context.path().to_string_lossy().into_owned(),
+                    "rev-list".into(),
+                    "--count".into(),
+                    oid.into(),
+                ],
+                None,
+                &[],
+            )?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("invalid commit count for {name}: {error}"))?;
+            Ok(dedupe::BranchSnapshot {
                 name,
                 oid: oid.into(),
+                tree_oid,
+                commit_count,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2882,26 +2976,23 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
     }) {
         protected.insert(default_branch.to_owned());
     }
-    let recovery_refs = m
+    let managed_refs = m
         .repositories
         .iter()
         .flat_map(|repo| repo.saved.iter())
-        .map(|saved| dedupe::RecoveryRef {
-            name: saved.remote_ref.clone(),
-            managed: saved.created_by_this_run && saved.verification == "push-succeeded",
-        })
+        .filter(|saved| saved.created_by_this_run && saved.verification == "push-succeeded")
+        .map(|saved| saved.remote_ref.clone())
+        .collect::<BTreeSet<_>>();
+    let branches = branches
+        .into_iter()
+        .filter(|branch| managed_refs.contains(&branch.name) && !protected.contains(&branch.name))
         .collect::<Vec<_>>();
-    let groups = dedupe::exact_duplicate_groups(branches, recovery_refs, &protected);
+    let groups = dedupe::tree_duplicate_groups(branches);
     for group in groups {
-        let keep = group
-            .branches
-            .iter()
-            .find(|name| !group.delete_candidates.contains(name))
-            .cloned()
-            .unwrap_or_default();
+        let keep = group.keep_branch.clone();
         println!(
-            "commit:{}\t{}\tkeep:{}\tdelete:{}",
-            group.oid,
+            "tree:{}\t{}\tkeep:{}\tdelete:{}",
+            group.tree_oid,
             group.branches.join(","),
             keep,
             group.delete_candidates.join(",")
@@ -4041,12 +4132,16 @@ mod dedupe_integration_tests {
             remote_oid(&remote_s, "refs/heads/main").unwrap().as_deref(),
             Some(oid.as_str())
         );
-        for name in refs {
-            assert_eq!(
-                remote_oid(&remote_s, &format!("refs/heads/{name}")).unwrap(),
-                None
-            );
-        }
+        assert_eq!(
+            remote_oid(&remote_s, &format!("refs/heads/{}", refs[0]))
+                .unwrap()
+                .as_deref(),
+            Some(oid.as_str())
+        );
+        assert_eq!(
+            remote_oid(&remote_s, &format!("refs/heads/{}", refs[1])).unwrap(),
+            None
+        );
         assert_eq!(
             remote_oid(&remote_s, "refs/heads/topic/short")
                 .unwrap()
