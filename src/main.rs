@@ -859,7 +859,11 @@ fn branch_inventory(path: &Path) -> Result<Vec<Branch>, String> {
     })
     .collect())
 }
-fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
+fn discover(
+    roots: &[PathBuf],
+    remote: &str,
+    mut checkpoint: impl FnMut(&[Repository], &[String]) -> Result<(), String>,
+) -> Result<(Vec<Repository>, Vec<String>), String> {
     let mut stores: BTreeMap<String, (PathBuf, Vec<String>)> = BTreeMap::new();
     let mut gaps = Vec::new();
     let mut canonical_roots = BTreeSet::new();
@@ -888,6 +892,7 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
         .cloned()
         .collect::<Vec<_>>();
     for root in &scan_roots {
+        eprintln!("discovery: walking {}", root.display());
         let mut matched_roots = HashSet::<PathBuf>::new();
         for entry in WalkDir::new(root)
             .follow_links(false)
@@ -961,9 +966,11 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
                 continue;
             }
         }
+        eprintln!("discovery: finished {}", root.display());
     }
     let mut repos = Vec::new();
-    for (_, (owner, mut matches)) in stores {
+    let total = stores.len();
+    for (index, (_, (owner, mut matches))) in stores.into_iter().enumerate() {
         matches.sort();
         if let Ok(wts) = parse_worktrees(&owner) {
             for wt in wts {
@@ -973,9 +980,11 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
                 }
             }
         }
+        eprintln!("inventory: {}/{} {}", index + 1, total, owner.display());
         repos.push(inventory_one(&owner, matches, remote));
+        checkpoint(&repos, &gaps)?;
     }
-    (repos, gaps)
+    Ok((repos, gaps))
 }
 fn save(m: &Manifest, state: &Path) -> Result<(), String> {
     fs::create_dir_all(state).map_err(|e| e.to_string())?;
@@ -1058,7 +1067,7 @@ fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
     if let Some(result) = cache.lock().map_err(|e| e.to_string())?.get(&cache_key) {
         return result.clone();
     }
-    let result = scan_commit_uncached(repo, oid, remote);
+    let result = scan_commits_uncached(repo, &[oid.to_owned()], remote, &[]);
     cache
         .lock()
         .map_err(|e| e.to_string())?
@@ -1066,7 +1075,52 @@ fn scan_commit(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
     result
 }
 
-fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), String> {
+fn scan_commits(repo: &Path, oids: &[String], remote: &str) -> Result<(), String> {
+    let cache = SECRET_SCAN_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let repo_name = repo
+        .canonicalize()
+        .unwrap_or_else(|_| repo.to_path_buf())
+        .display()
+        .to_string();
+    let uncached = {
+        let cache = cache.lock().map_err(|e| e.to_string())?;
+        oids.iter()
+            .filter(|oid| !cache.contains_key(&format!("{repo_name}\0{remote}\0{oid}")))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    if uncached.is_empty() {
+        return Ok(());
+    }
+    let result = scan_commits_uncached(repo, &uncached, remote, &[]);
+    let mut cache = cache.lock().map_err(|e| e.to_string())?;
+    for oid in uncached {
+        cache.insert(format!("{repo_name}\0{remote}\0{oid}"), result.clone());
+    }
+    result
+}
+
+fn scan_commit_delta(
+    repo: &Path,
+    oid: &str,
+    parent: Option<&str>,
+    remote: &str,
+) -> Result<(), String> {
+    let excluded = parent.map(str::to_owned).into_iter().collect::<Vec<_>>();
+    scan_commits_uncached(repo, &[oid.to_owned()], remote, &excluded)
+}
+
+fn scan_commits_uncached(
+    repo: &Path,
+    oids: &[String],
+    remote: &str,
+    additionally_excluded: &[String],
+) -> Result<(), String> {
+    if oids.is_empty() {
+        return Ok(());
+    }
     // Run the maintained scanner against the exact commit ancestry before any
     // object upload. Never persist scanner output or print a finding.
     let remote_refs = if remote.is_empty() {
@@ -1104,7 +1158,7 @@ fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), Stri
             .display()
     );
     let commit_cache = REMOTE_COMMIT_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let excluded = if let Some(value) = commit_cache
+    let mut excluded = if let Some(value) = commit_cache
         .lock()
         .map_err(|e| e.to_string())?
         .get(&excluded_key)
@@ -1132,7 +1186,8 @@ fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), Stri
             .insert(excluded_key, Ok(found.clone()));
         found
     };
-    let mut range = oid.to_owned();
+    excluded.extend(additionally_excluded.iter().cloned());
+    let mut range = oids.join(" ");
     if !excluded.is_empty() {
         range.push_str(" --not ");
         range.push_str(&excluded.iter().cloned().collect::<Vec<_>>().join(" "));
@@ -1140,7 +1195,7 @@ fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), Stri
     let report = env::temp_dir().join(format!(
         "far-gitleaks-{}-{}.json",
         std::process::id(),
-        hash_name(oid)
+        hash_name(&range)
     ));
     let scan = vec![
         "gitleaks".into(),
@@ -1148,7 +1203,7 @@ fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), Stri
         "--no-banner".into(),
         "--redact".into(),
         "--log-opts".into(),
-        range.clone(),
+        range,
         "--report-format".into(),
         "json".into(),
         "--report-path".into(),
@@ -1176,11 +1231,8 @@ fn scan_commit_uncached(repo: &Path, oid: &str, remote: &str) -> Result<(), Stri
         ));
     }
     let r = sensitive_re(repo);
-    let mut rev_args = vec![
-        "rev-list".to_owned(),
-        "--objects".to_owned(),
-        oid.to_owned(),
-    ];
+    let mut rev_args = vec!["rev-list".to_owned(), "--objects".to_owned()];
+    rev_args.extend(oids.iter().cloned());
     if !excluded.is_empty() {
         rev_args.push("--not".into());
         rev_args.extend(excluded.iter().map(|x| (*x).to_owned()));
@@ -1519,12 +1571,7 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
                 r.verification_error = Some(error);
                 continue;
             }
-            if let Err(error) = push_lfs_payloads(&path, &remote, &r.lfs_files) {
-                r.lfs_preservation = "blocked".into();
-                r.verification_error = Some(error);
-                continue;
-            }
-            r.lfs_preservation = "push-succeeded".into();
+            r.lfs_preservation = "scanned".into();
         } else {
             r.lfs_preservation = "not-required".into();
         }
@@ -1548,6 +1595,38 @@ fn preserve(m: &mut Manifest) -> Result<(), String> {
             r.verification_error =
                 Some("local branches or worktree HEADs changed since scan".into());
             continue;
+        }
+        let mut scan_oids = BTreeSet::new();
+        scan_oids.extend(r.branches.iter().map(|branch| branch.commit.clone()));
+        scan_oids.extend(r.unreachable_commits.iter().cloned());
+        scan_oids.extend(
+            r.stashes
+                .iter()
+                .filter_map(|stash| stash.split_whitespace().next().map(str::to_owned)),
+        );
+        scan_oids.extend(r.refs.iter().filter_map(|entry| {
+            let (name, tail) = entry.split_once(' ')?;
+            name.starts_with("refs/recovery-local/")
+                .then(|| tail.split_whitespace().next().map(str::to_owned))
+                .flatten()
+        }));
+        scan_oids.extend(
+            r.worktrees.iter().filter_map(|worktree| {
+                (worktree.detached).then(|| worktree.head.clone()).flatten()
+            }),
+        );
+        if let Err(error) = scan_commits(&path, &scan_oids.into_iter().collect::<Vec<_>>(), &remote)
+        {
+            r.verification_error = Some(error);
+            continue;
+        }
+        if !r.lfs_files.is_empty() {
+            if let Err(error) = push_lfs_payloads(&path, &remote, &r.lfs_files) {
+                r.lfs_preservation = "blocked".into();
+                r.verification_error = Some(error);
+                continue;
+            }
+            r.lfs_preservation = "push-succeeded".into();
         }
         let common = r.common_dir.clone();
         let branches = r.branches.clone();
@@ -1902,7 +1981,7 @@ fn save_worktree(
             (!head.is_empty()).then_some(head),
             "recovery staged snapshot",
         )?;
-        scan_commit(path, &commit, remote)?;
+        scan_commit_delta(path, &commit, (!head.is_empty()).then_some(head), remote)?;
         let name = format!("staged:{}", wt.path);
         let reference = recovery_ref(
             &Repository {
@@ -1930,7 +2009,7 @@ fn save_worktree(
         .as_deref()
         .or((!head.is_empty()).then_some(head));
     let commit = commit_snapshot(path, &full, parent, "recovery full worktree snapshot")?;
-    scan_commit(path, &commit, remote)?;
+    scan_commit_delta(path, &commit, parent, remote)?;
     let name = format!("worktree:{}", wt.path);
     let reference = recovery_ref(
         &Repository {
@@ -2680,6 +2759,25 @@ fn cleanup_repository(
 fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
     let remote = m.remote.clone();
     reject_remote_url_rewrite(&remote, None)?;
+    for repo in &m.repositories {
+        if temporary_recovery_fixture(Path::new(&repo.path)) {
+            continue;
+        }
+        for branch in &repo.branches {
+            let pushed = repo.saved.iter().any(|saved| {
+                saved.source == "branch"
+                    && saved.name == format!("branch:{}", branch.name)
+                    && saved.commit == branch.commit
+                    && saved.verification == "push-succeeded"
+            });
+            if !pushed {
+                return Err(format!(
+                    "dedupe blocked; local branch not recorded as pushed: {} ({})",
+                    branch.name, repo.path
+                ));
+            }
+        }
+    }
     let push_context = tempfile::Builder::new()
         .prefix("find-and-recovery-dedupe-")
         .tempdir()
@@ -2705,17 +2803,68 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
         None,
         &[],
     )?;
+    // Fetch remote heads into a new bare repository without local alternates.
+    out(
+        &[
+            "git".into(),
+            "-C".into(),
+            push_context.path().to_string_lossy().into_owned(),
+            "fetch".into(),
+            "--no-tags".into(),
+            remote.clone(),
+            "+refs/heads/*:refs/remotes/dedupe/*".into(),
+        ],
+        None,
+        &[],
+    )?;
+    let heads_after_fetch = out(
+        &[
+            "git".into(),
+            "ls-remote".into(),
+            "--heads".into(),
+            remote.clone(),
+        ],
+        None,
+        &[],
+    )?;
+    if heads.lines().collect::<BTreeSet<_>>() != heads_after_fetch.lines().collect::<BTreeSet<_>>()
+    {
+        return Err("remote branches changed during duplicate scan; rerun dedupe".into());
+    }
+    let mut branch_oids = BTreeMap::new();
     let branches = heads
         .lines()
-        .filter_map(|line| {
-            let (oid, name) = line.split_once('\t')?;
-            Some(dedupe::RemoteBranch {
-                name: name.strip_prefix("refs/heads/")?.into(),
+        .map(|line| -> Result<dedupe::RemoteBranch, String> {
+            let (oid, full_name) = line.split_once('\t').ok_or("malformed ls-remote row")?;
+            let name = full_name
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| format!("unexpected remote ref {full_name}"))?
+                .to_owned();
+            let fetched_oid = out(
+                &[
+                    "git".into(),
+                    "-C".into(),
+                    push_context.path().to_string_lossy().into_owned(),
+                    "rev-parse".into(),
+                    format!("refs/remotes/dedupe/{name}"),
+                ],
+                None,
+                &[],
+            )?
+            .trim()
+            .to_owned();
+            if fetched_oid != oid {
+                return Err(format!("remote branch changed during scan: {name}"));
+            }
+            branch_oids.insert(name.clone(), oid.to_owned());
+            Ok(dedupe::RemoteBranch {
+                name,
                 oid: oid.into(),
             })
         })
-        .collect::<Vec<_>>();
-    let sym = out(
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut protected: BTreeSet<String> = ["main".into(), "master".into()].into_iter().collect();
+    let default_head = out(
         &[
             "git".into(),
             "ls-remote".into(),
@@ -2726,31 +2875,23 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
         None,
         &[],
     )?;
-    let default = sym.lines().find_map(|line| {
+    if let Some(default_branch) = default_head.lines().find_map(|line| {
         line.strip_prefix("ref: refs/heads/")?
-            .split_whitespace()
-            .next()
-            .map(str::to_owned)
-    });
-    let manifest_refs = m
+            .split_once('\t')
+            .map(|v| v.0)
+    }) {
+        protected.insert(default_branch.to_owned());
+    }
+    let recovery_refs = m
         .repositories
         .iter()
-        .flat_map(|repo| &repo.saved)
-        .map(|saved| (saved.remote_ref.clone(), saved.created_by_this_run))
-        .collect::<BTreeMap<_, _>>();
-    let ownership = branches
-        .iter()
-        .filter(|branch| recovery_ref_is_owned_name(&branch.name))
-        .map(|branch| dedupe::RecoveryRef {
-            name: branch.name.clone(),
-            managed: manifest_refs.get(&branch.name).copied().unwrap_or(false),
+        .flat_map(|repo| repo.saved.iter())
+        .map(|saved| dedupe::RecoveryRef {
+            name: saved.remote_ref.clone(),
+            managed: saved.created_by_this_run && saved.verification == "push-succeeded",
         })
         .collect::<Vec<_>>();
-    let mut protected: BTreeSet<String> = ["main".into(), "master".into()].into_iter().collect();
-    if let Some(name) = default {
-        protected.insert(name);
-    }
-    let groups = dedupe::exact_duplicate_groups(branches, ownership, &protected);
+    let groups = dedupe::exact_duplicate_groups(branches, recovery_refs, &protected);
     for group in groups {
         let keep = group
             .branches
@@ -2759,43 +2900,50 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
             .cloned()
             .unwrap_or_default();
         println!(
-            "{}\\t{}\\tkeep:{}\\tdelete:{}",
+            "commit:{}\t{}\tkeep:{}\tdelete:{}",
             group.oid,
             group.branches.join(","),
             keep,
             group.delete_candidates.join(",")
         );
         for name in group.delete_candidates {
-            if !recovery_ref_is_owned_name(&name) {
-                continue;
-            }
+            let candidate_oid = branch_oids
+                .get(&name)
+                .ok_or_else(|| format!("missing scanned tip for {name}"))?;
+            let keep_oid = branch_oids
+                .get(&keep)
+                .ok_or_else(|| format!("missing scanned tip for {keep}"))?;
             if !execute {
-                println!("preview-delete\\t{name}\\tkeep\\t{keep}");
+                println!("preview-delete\t{name}\tkeep\t{keep}");
                 continue;
             }
             if remote_oid(&remote, &format!("refs/heads/{name}"))?.as_deref()
-                != Some(group.oid.as_str())
+                != Some(candidate_oid.as_str())
             {
                 eprintln!("retained {name}; remote tip changed");
                 continue;
             }
             if remote_oid(&remote, &format!("refs/heads/{keep}"))?.as_deref()
-                != Some(group.oid.as_str())
+                != Some(keep_oid.as_str())
             {
-                eprintln!("retained {name}; duplicate target changed: {keep}");
+                eprintln!("retained {name}; keep branch changed: {keep}");
                 continue;
             }
+            // Conditional ref deletion: abort if the observed tip changed.
             out(
                 &[
                     "git".into(),
                     "push".into(),
-                    remote.clone(),
                     "--delete".into(),
+                    remote.clone(),
                     name.clone(),
                 ],
                 Some(push_context.path()),
                 &[],
             )?;
+            if remote_oid(&remote, &format!("refs/heads/{name}"))?.is_some() {
+                return Err(format!("remote branch still exists after deletion: {name}"));
+            }
             for repo in &mut m.repositories {
                 if repo.deletion == "deleted" || repo.deletion.starts_with("blocked") {
                     for saved in &mut repo.saved {
@@ -2806,16 +2954,11 @@ fn dedupe(m: &mut Manifest, state: &Path, execute: bool) -> Result<(), String> {
                 }
             }
             save(m, state)?;
-            println!("deleted\\t{name}");
+            println!("deleted\t{name}");
         }
     }
     Ok(())
 }
-
-fn recovery_ref_is_owned_name(name: &str) -> bool {
-    name.starts_with("recovery/") && !name.split('/').any(|part| part == "..")
-}
-
 fn main() -> Result<(), String> {
     let cli = Cli::parse();
     let state = cli.state.canonicalize().unwrap_or(cli.state.clone());
@@ -2847,7 +2990,6 @@ fn main() -> Result<(), String> {
             }
             let roots = if roots.is_empty() {
                 vec![
-                    "/".into(),
                     "/Users".into(),
                     "/Volumes".into(),
                     "/opt".into(),
@@ -2862,9 +3004,36 @@ fn main() -> Result<(), String> {
                 .iter()
                 .map(|x| x.to_string_lossy().into_owned())
                 .collect();
-            let (r, g) = discover(&roots, &m.remote);
+            m.repositories.clear();
+            m.coverage_gaps.clear();
+            m.generated_unix = now();
+            save(&m, &state)?;
+            let remote = m.remote.clone();
+            let (r, g) = discover(&roots, &remote, |partial, gaps| {
+                m.repositories = partial.to_vec();
+                m.coverage_gaps = gaps.to_vec();
+                m.generated_unix = now();
+                save(&m, &state)
+            })?;
             m.repositories = r;
             m.coverage_gaps = g;
+            for skipped in [
+                "/Applications",
+                "/Library",
+                "/System",
+                "/usr",
+                "/bin",
+                "/sbin",
+                "/pkg",
+                "/cores",
+                "/private/etc",
+                "/private/var",
+                "/private/tftpboot",
+            ] {
+                m.coverage_gaps.push(format!(
+                    "scan root omitted to avoid traversing system data: {skipped}"
+                ));
+            }
             m.generated_unix = now();
             save(&m, &state)?;
             println!("{}", serde_json::to_string_pretty(&m).unwrap());
@@ -3790,6 +3959,61 @@ mod dedupe_integration_tests {
                 format!("{oid}:refs/heads/{name}"),
             ]);
         }
+        fs::write(local.join("same-tree.txt"), "same committed content\n").unwrap();
+        run(&[
+            "git".into(),
+            "-C".into(),
+            local.display().to_string(),
+            "add".into(),
+            "same-tree.txt".into(),
+        ]);
+        run(&[
+            "git".into(),
+            "-C".into(),
+            local.display().to_string(),
+            "commit".into(),
+            "-m".into(),
+            "same tree short history".into(),
+        ]);
+        let short_oid = run(&[
+            "git".into(),
+            "-C".into(),
+            local.display().to_string(),
+            "rev-parse".into(),
+            "HEAD".into(),
+        ]);
+        run(&[
+            "git".into(),
+            "-C".into(),
+            local.display().to_string(),
+            "push".into(),
+            remote_s.clone(),
+            format!("{short_oid}:refs/heads/topic/short"),
+        ]);
+        run(&[
+            "git".into(),
+            "-C".into(),
+            local.display().to_string(),
+            "commit".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "same tree longer history".into(),
+        ]);
+        let long_oid = run(&[
+            "git".into(),
+            "-C".into(),
+            local.display().to_string(),
+            "rev-parse".into(),
+            "HEAD".into(),
+        ]);
+        run(&[
+            "git".into(),
+            "-C".into(),
+            local.display().to_string(),
+            "push".into(),
+            remote_s.clone(),
+            format!("{long_oid}:refs/heads/topic/long"),
+        ]);
         let mut manifest = Manifest {
             remote: remote_s.clone(),
             repositories: vec![Repository {
@@ -3823,6 +4047,18 @@ mod dedupe_integration_tests {
                 None
             );
         }
+        assert_eq!(
+            remote_oid(&remote_s, "refs/heads/topic/short")
+                .unwrap()
+                .as_deref(),
+            Some(short_oid.as_str())
+        );
+        assert_eq!(
+            remote_oid(&remote_s, "refs/heads/topic/long")
+                .unwrap()
+                .as_deref(),
+            Some(long_oid.as_str())
+        );
     }
 
     #[test]

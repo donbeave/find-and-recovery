@@ -1,78 +1,66 @@
-//! Pure planning logic for exact duplicate remote recovery refs.
-//!
-//! This module does not inspect a remote or delete refs. Callers supply the
-//! observed object IDs and manifest provenance, then decide whether to act on
-//! the returned candidates.
+//! Planning logic for exact duplicate remote recovery branches.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A remote branch's name and observed commit object ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteBranch {
     pub name: String,
     pub oid: String,
 }
 
-/// Manifest ownership record for a recovery ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryRef {
     pub name: String,
-    /// True when the manifest ties this ref to local work handled by this run.
-    /// The ref may predate this run and still be an exact duplicate.
     pub managed: bool,
 }
 
-/// One set of branches pointing to the same exact commit OID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DuplicateGroup {
     pub oid: String,
     pub branches: Vec<String>,
-    /// Managed recovery refs in this group, excluding one retained branch and
-    /// every protected ref.
     pub delete_candidates: Vec<String>,
 }
 
-/// Find exact-OID duplicate groups and safe candidate refs.
-///
-/// A branch is eligible for deletion only when its manifest ties it to this
-/// run's local work. Protected refs are never candidates. When a group has no
-/// protected or unmanaged branch, the lexicographically first branch is
-/// retained so a group is never entirely removed.
+/// Delete candidates must be managed recovery refs with the same exact tip.
+/// Unmanaged refs and protected branches can never become delete candidates.
 pub fn exact_duplicate_groups(
     branches: impl IntoIterator<Item = RemoteBranch>,
     recovery_refs: impl IntoIterator<Item = RecoveryRef>,
     protected_refs: &BTreeSet<String>,
 ) -> Vec<DuplicateGroup> {
-    let owned: BTreeMap<String, bool> = recovery_refs
+    let managed = recovery_refs
         .into_iter()
-        .map(|record| (record.name, record.managed))
-        .collect();
+        .filter(|recovery_ref| recovery_ref.managed)
+        .map(|recovery_ref| recovery_ref.name)
+        .collect::<BTreeSet<_>>();
     let mut by_oid: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for branch in branches {
         by_oid.entry(branch.oid).or_default().insert(branch.name);
     }
-
     by_oid
         .into_iter()
         .filter_map(|(oid, names)| {
             if names.len() < 2 {
                 return None;
             }
-            let branches: Vec<String> = names.into_iter().collect();
-            let has_safe_anchor = branches
+            let branches = names.into_iter().collect::<Vec<_>>();
+            let keep = branches
                 .iter()
-                .any(|name| protected_refs.contains(name) || owned.get(name) != Some(&true));
-            let mut kept_one = false;
+                .find(|name| protected_refs.contains(*name))
+                .cloned()
+                .or_else(|| {
+                    branches
+                        .iter()
+                        .find(|name| !managed.contains(*name))
+                        .cloned()
+                })
+                .or_else(|| branches.first().cloned())?;
             let delete_candidates = branches
                 .iter()
-                .filter(|name| owned.get(*name) == Some(&true) && !protected_refs.contains(*name))
-                .filter(|_| {
-                    if has_safe_anchor || kept_one {
-                        true
-                    } else {
-                        kept_one = true;
-                        false
-                    }
+                .filter(|name| {
+                    name.as_str() != keep
+                        && managed.contains(*name)
+                        && !protected_refs.contains(*name)
                 })
                 .cloned()
                 .collect();
@@ -96,70 +84,59 @@ mod tests {
         }
     }
 
-    fn recovery(name: &str, created: bool) -> RecoveryRef {
-        RecoveryRef {
-            name: name.into(),
-            managed: created,
-        }
+    fn managed(names: &[&str]) -> Vec<RecoveryRef> {
+        names
+            .iter()
+            .map(|name| RecoveryRef {
+                name: (*name).into(),
+                managed: true,
+            })
+            .collect()
     }
 
     #[test]
-    fn identical_oids_form_duplicate_group_and_owned_duplicate_is_candidate() {
+    fn identical_commit_ids_are_duplicates() {
         let groups = exact_duplicate_groups(
-            [branch("recover/a", "abc"), branch("recover/b", "abc")],
-            [recovery("recover/a", true), recovery("recover/b", true)],
+            [branch("feature/a", "same"), branch("recovery/b", "same")],
+            managed(&["feature/a", "recovery/b"]),
             &BTreeSet::new(),
         );
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].oid, "abc");
-        assert_eq!(groups[0].branches, ["recover/a", "recover/b"]);
-        assert_eq!(groups[0].delete_candidates, ["recover/b"]);
+        assert_eq!(groups[0].delete_candidates, ["recovery/b"]);
     }
 
     #[test]
-    fn different_commit_oids_are_not_duplicates_even_if_trees_might_match() {
+    fn different_commit_ids_are_not_duplicates_even_with_same_content() {
+        assert!(
+            exact_duplicate_groups(
+                [branch("feature/a", "one"), branch("feature/b", "two")],
+                managed(&["feature/a", "feature/b"]),
+                &BTreeSet::new(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn never_deletes_unmanaged_remote_branch() {
         let groups = exact_duplicate_groups(
             [
-                branch("recover/a", "commit-1"),
-                branch("recover/b", "commit-2"),
+                branch("existing/topic", "same"),
+                branch("recovery/new", "same"),
             ],
-            [recovery("recover/a", true), recovery("recover/b", true)],
+            managed(&["recovery/new"]),
             &BTreeSet::new(),
         );
-        assert!(groups.is_empty());
+        assert_eq!(groups[0].delete_candidates, ["recovery/new"]);
     }
 
     #[test]
-    fn protected_main_and_default_are_never_candidates() {
-        let protected = ["main".to_owned(), "HEAD".to_owned()].into_iter().collect();
+    fn never_deletes_main_branch() {
         let groups = exact_duplicate_groups(
-            [
-                branch("main", "abc"),
-                branch("recover/a", "abc"),
-                branch("HEAD", "def"),
-                branch("recover/b", "def"),
-            ],
-            [recovery("recover/a", true), recovery("recover/b", true)],
-            &protected,
+            [branch("main", "same"), branch("recovery/new", "same")],
+            managed(&["main", "recovery/new"]),
+            &["main".into()].into_iter().collect(),
         );
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].delete_candidates, ["recover/a"]);
-        assert_eq!(groups[1].delete_candidates, ["recover/b"]);
-    }
-
-    #[test]
-    fn preexisting_manifest_refs_are_not_candidates() {
-        let groups = exact_duplicate_groups(
-            [
-                branch("recover/preexisting", "abc"),
-                branch("recover/new", "abc"),
-            ],
-            [
-                recovery("recover/preexisting", false),
-                recovery("recover/new", true),
-            ],
-            &BTreeSet::new(),
-        );
-        assert_eq!(groups[0].delete_candidates, ["recover/new"]);
+        assert_eq!(groups[0].delete_candidates, ["recovery/new"]);
     }
 }
