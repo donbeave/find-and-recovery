@@ -2547,9 +2547,11 @@ fn cleanup_repository(
                 wt.display()
             ));
         }
-        validate_nested_inventory(expected)?;
-        for saved in &r.saved {
-            isolated_verify_saved(remote, saved)?;
+        if !branches_only {
+            validate_nested_inventory(expected)?;
+            for saved in &r.saved {
+                isolated_verify_saved(remote, saved)?;
+            }
         }
         git(
             &owner,
