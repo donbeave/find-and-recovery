@@ -3898,6 +3898,7 @@ fn cleanup_repository(
             }
         }
         isolated_verify_saved_lfs(remote, r)?;
+        cleanup_recheck_unreachable(r)?;
         if filesystem_identity(&owner) != r.device.zip(r.inode) {
             return Err("repository device/inode changed immediately before deletion".into());
         }
@@ -4591,8 +4592,7 @@ mod preservation_tests {
         let mut m = manifest(&local, &remote_s);
         preserve(&mut m).unwrap();
         assert_eq!(
-            m.repositories[0].preservation,
-            "complete",
+            m.repositories[0].preservation, "complete",
             "{:?}",
             m.repositories[0].verification_error
         );
@@ -4631,6 +4631,39 @@ mod preservation_tests {
         let removed = cleanup_repository(&m.repositories[0], &remote_s, &state, false).unwrap();
         assert_eq!(removed, vec![local.to_string_lossy().into_owned()]);
         assert!(!local.exists());
+    }
+
+    #[test]
+    fn bare_cleanup_blocks_new_unreachable_object() {
+        let (_temp, _local, remote, remote_s) = fixture();
+        let bare = remote.parent().unwrap().join("local-bare.git");
+        cmd(&[
+            "git",
+            "clone",
+            "--bare",
+            remote.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        let mut m = manifest(&bare, &remote_s);
+        preserve(&mut m).unwrap();
+        assert_eq!(m.repositories[0].preservation, "complete");
+        verify_repository(&mut m.repositories[0], &remote_s);
+        preview(&mut m, false);
+        assert_eq!(m.repositories[0].deletion, "eligible");
+
+        cmd(&[
+            "git",
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "hash-object",
+            "-w",
+            "--stdin",
+        ]);
+        let state = bare.parent().unwrap().join("external-state");
+        fs::create_dir_all(&state).unwrap();
+        let error = cleanup_repository(&m.repositories[0], &remote_s, &state, false).unwrap_err();
+        assert!(error.contains("new unpreserved unreachable Git object"), "{error}");
+        assert!(bare.exists(), "bare repository with a new object was deleted");
     }
 
     #[test]
@@ -5015,18 +5048,26 @@ mod preservation_tests {
         let mut m = manifest(&local, &remote_s);
         preserve(&mut m).unwrap();
         assert_eq!(m.repositories[0].preservation, "blocked");
-        assert!(m.repositories[0]
-            .verification_error
-            .as_deref()
-            .is_some_and(|error| error.contains("ignored content")));
+        assert!(
+            m.repositories[0]
+                .verification_error
+                .as_deref()
+                .is_some_and(|error| error.contains("ignored content"))
+        );
         preview(&mut m, false);
         assert!(m.repositories[0].deletion.starts_with("blocked-"));
         let state = local.parent().unwrap().join("external-state");
         fs::create_dir_all(&state).unwrap();
         let error = cleanup_repository(&m.repositories[0], &remote_s, &state, false).unwrap_err();
-        assert!(error.contains("ignored-content") || error.contains("preservation"), "unexpected cleanup error: {error}");
+        assert!(
+            error.contains("ignored-content") || error.contains("preservation"),
+            "unexpected cleanup error: {error}"
+        );
         assert!(local.exists(), "clone with ignored content was deleted");
-        assert_eq!(fs::read_to_string(local.join("ignored.txt")).unwrap(), "ignored contents\n");
+        assert_eq!(
+            fs::read_to_string(local.join("ignored.txt")).unwrap(),
+            "ignored contents\n"
+        );
     }
 
     #[test]
