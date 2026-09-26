@@ -468,6 +468,23 @@ fn validate_nested_inventory(worktree: &Worktree) -> Result<(), String> {
     }
     Ok(())
 }
+fn validate_ignored_nested_inventory(worktree: &Worktree) -> Result<(), String> {
+    let root = Path::new(&worktree.path);
+    for relative in &worktree.ignored {
+        let candidate = root.join(relative);
+        let marker = candidate.join(".git");
+        if marker.exists() || marker.is_symlink() {
+            return Err(format!(
+                "nested repository blocks cleanup: {}",
+                marker.display()
+            ));
+        }
+        if candidate.is_dir() {
+            ensure_no_nested_git(&candidate)?;
+        }
+    }
+    Ok(())
+}
 fn inventory_worktree(
     owner: &Path,
     common: &Path,
@@ -765,10 +782,12 @@ fn inventory_one(path: &Path, matched: Vec<String>, remote: &str) -> Repository 
                 .map(str::to_owned)
                 .collect();
         }
-        // This workflow inventories refs and detached worktree HEADs. A full
-        // `git fsck --unreachable` is intentionally omitted: it can consume
-        // gigabytes in large object stores, and unreachable objects are not
-        // part of the user's branch-push scope.
+        enumerate_unreachable(
+            path,
+            &r.worktrees,
+            &mut r.unreachable_commits,
+            &mut r.unreachable_noncommits,
+        )?;
         let mut represented = reachable_objects(path, &r.worktrees)?;
         for wt in &r.worktrees {
             for t in [&wt.index_tree].into_iter().flatten() {
@@ -921,6 +940,8 @@ fn discover(roots: &[PathBuf], remote: &str) -> (Vec<Repository>, Vec<String>) {
                     && common.join("HEAD").is_file()
                     && common.join("config").is_file()
                     && common.join("objects").is_dir()
+                    && git(&common, &["rev-parse", "--is-bare-repository"])
+                        .is_ok_and(|value| value.trim() == "true")
                     && target_path(&common, remote);
                 let owner = if common_is_target_bare {
                     common.clone()
@@ -2142,28 +2163,32 @@ fn verify_repository(r: &mut Repository, remote: &str) {
 }
 
 fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
-    if branches_only {
-        return Some("blocked-branch-only-cleanup-does-not-preserve-worktree-state".into());
-    }
     if temporary_recovery_fixture(Path::new(&r.path)) {
         return Some("blocked-temporary-recovery-fixture".into());
     }
     if !r.inventory_complete {
         return Some("blocked-incomplete-inventory".into());
     }
-    if r.preservation != "complete" {
+    if !branches_only && r.preservation != "complete" {
         return Some("blocked-preservation".into());
     }
-    if r.saved
-        .iter()
-        .any(|saved| saved.verification != "isolated-verified")
-    {
-        return Some("blocked-isolated-verification-required".into());
+    if r.saved.iter().any(|saved| {
+        if branches_only {
+            saved.source == "branch" && saved.verification != "push-succeeded"
+        } else {
+            saved.verification != "isolated-verified"
+        }
+    }) {
+        return Some("blocked-branch-push-not-successful".into());
     }
-    if !r.lfs_files.is_empty() {
+    if !branches_only && !r.lfs_files.is_empty() {
         return Some("blocked-LFS-payloads".into());
     }
-    for worktree in r.worktrees.iter().filter(|w| !w.ignored.is_empty()) {
+    for worktree in r
+        .worktrees
+        .iter()
+        .filter(|w| !branches_only && !w.ignored.is_empty())
+    {
         if !r.saved.iter().any(|saved| {
             saved.source == "worktree-snapshot"
                 && saved.name == format!("worktree:{}", worktree.path)
@@ -2187,20 +2212,37 @@ fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
     if r.kind != "clone" && r.kind != "bare" {
         return Some("blocked-repository-kind".into());
     }
-    if r.worktrees.iter().any(|w| {
-        w.foreign_registration
-            || w.nested_repositories
-                .iter()
-                .any(|item| skipped_tree_path(item).is_none())
-    }) {
-        return Some("blocked-worktree-dependency".into());
+    for worktree in &r.worktrees {
+        if worktree.foreign_registration {
+            return Some("blocked-worktree-dependency".into());
+        }
+        for item in &worktree.nested_repositories {
+            if let Some(path) = skipped_tree_path(item) {
+                if ensure_no_nested_git(path).is_err() {
+                    return Some("blocked-worktree-dependency".into());
+                }
+            } else if branches_only
+                && item == "<nested-repository scan skipped because ignored content blocks cleanup>"
+            {
+                if validate_ignored_nested_inventory(worktree).is_err() {
+                    return Some("blocked-worktree-dependency".into());
+                }
+            } else {
+                return Some("blocked-worktree-dependency".into());
+            }
+        }
     }
     for b in &r.branches {
         if !r.saved.iter().any(|s| {
             s.source == "branch"
                 && s.name == format!("branch:{}", b.name)
                 && s.commit == b.commit
-                && s.verification == "isolated-verified"
+                && s.verification
+                    == if branches_only {
+                        "push-succeeded"
+                    } else {
+                        "isolated-verified"
+                    }
         }) {
             return Some(format!("blocked-unpushed-branch:{}", b.name));
         }
@@ -3339,7 +3381,7 @@ mod preservation_tests {
     }
 
     #[test]
-    fn branch_only_cleanup_is_refused_when_worktree_content_is_unpreserved() {
+    fn branch_only_cleanup_deletes_only_after_all_branches_push() {
         let (_t, local, remote, remote_s) = fixture();
         fs::write(
             local.join("local-secret.txt"),
@@ -3366,15 +3408,11 @@ mod preservation_tests {
             .commit
             .clone();
         preview(&mut m, true);
-        assert!(
-            m.repositories[0]
-                .deletion
-                .contains("branch-only-cleanup-does-not-preserve-worktree-state")
-        );
+        assert_eq!(m.repositories[0].deletion, "eligible");
         let state = local.parent().unwrap().join("external-state");
         fs::create_dir_all(&state).unwrap();
-        assert!(cleanup_repository(&m.repositories[0], &remote_s, &state, true).is_err());
-        assert!(local.exists());
+        cleanup_repository(&m.repositories[0], &remote_s, &state, true).unwrap();
+        assert!(!local.exists());
         assert!(
             !cmd(&[
                 "git",
