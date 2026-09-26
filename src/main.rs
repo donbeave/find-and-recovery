@@ -2142,32 +2142,28 @@ fn verify_repository(r: &mut Repository, remote: &str) {
 }
 
 fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
+    if branches_only {
+        return Some("blocked-branch-only-cleanup-does-not-preserve-worktree-state".into());
+    }
     if temporary_recovery_fixture(Path::new(&r.path)) {
         return Some("blocked-temporary-recovery-fixture".into());
     }
     if !r.inventory_complete {
         return Some("blocked-incomplete-inventory".into());
     }
-    if !branches_only && r.preservation != "complete" {
+    if r.preservation != "complete" {
         return Some("blocked-preservation".into());
     }
-    if r.saved.iter().any(|saved| {
-        if branches_only {
-            saved.source == "branch" && saved.verification != "push-succeeded"
-        } else {
-            saved.verification != "isolated-verified"
-        }
-    }) {
-        return Some("blocked-branch-push-not-successful".into());
+    if r.saved
+        .iter()
+        .any(|saved| saved.verification != "isolated-verified")
+    {
+        return Some("blocked-isolated-verification-required".into());
     }
-    if !branches_only && !r.lfs_files.is_empty() {
+    if !r.lfs_files.is_empty() {
         return Some("blocked-LFS-payloads".into());
     }
-    for worktree in r
-        .worktrees
-        .iter()
-        .filter(|w| !branches_only && !w.ignored.is_empty())
-    {
+    for worktree in r.worktrees.iter().filter(|w| !w.ignored.is_empty()) {
         if !r.saved.iter().any(|saved| {
             saved.source == "worktree-snapshot"
                 && saved.name == format!("worktree:{}", worktree.path)
@@ -2204,19 +2200,13 @@ fn cleanup_blocker(r: &Repository, branches_only: bool) -> Option<String> {
             s.source == "branch"
                 && s.name == format!("branch:{}", b.name)
                 && s.commit == b.commit
-                && s.verification
-                    == if branches_only {
-                        "push-succeeded"
-                    } else {
-                        "isolated-verified"
-                    }
+                && s.verification == "isolated-verified"
         }) {
             return Some(format!("blocked-unpushed-branch:{}", b.name));
         }
     }
     for w in &r.worktrees {
-        if !branches_only
-            && w.detached
+        if w.detached
             && !r
                 .branches
                 .iter()
@@ -3349,7 +3339,7 @@ mod preservation_tests {
     }
 
     #[test]
-    fn branch_only_cleanup_deletes_only_after_all_branches_push() {
+    fn branch_only_cleanup_is_refused_when_worktree_content_is_unpreserved() {
         let (_t, local, remote, remote_s) = fixture();
         fs::write(
             local.join("local-secret.txt"),
@@ -3376,11 +3366,15 @@ mod preservation_tests {
             .commit
             .clone();
         preview(&mut m, true);
-        assert_eq!(m.repositories[0].deletion, "eligible");
+        assert!(
+            m.repositories[0]
+                .deletion
+                .contains("branch-only-cleanup-does-not-preserve-worktree-state")
+        );
         let state = local.parent().unwrap().join("external-state");
         fs::create_dir_all(&state).unwrap();
-        cleanup_repository(&m.repositories[0], &remote_s, &state, true).unwrap();
-        assert!(!local.exists());
+        assert!(cleanup_repository(&m.repositories[0], &remote_s, &state, true).is_err());
+        assert!(local.exists());
         assert!(
             !cmd(&[
                 "git",
