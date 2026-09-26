@@ -1,11 +1,14 @@
 #[path = "../src/conditional_delete.rs"]
 mod conditional_delete;
 
-use conditional_delete::{Candidate, delete_candidates_if_unchanged};
+use conditional_delete::{
+    BranchCandidate, RefAssertion, RefState, RetentionAnchor, ReviewedDeletionFacts,
+    ValidatedDestination, VerifiedDeletionScope, delete_branches_if_unchanged,
+};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 #[test]
-fn both_delete_apis_fail_closed_without_invoking_git() {
+fn invalid_candidate_fails_before_starting_git() {
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -29,22 +32,96 @@ fn both_delete_apis_fail_closed_without_invoking_git() {
         std::env::set_var("FNR_GIT_CALLED", &marker);
     }
 
-    let candidate = Candidate {
-        remote_ref: "refs/heads/topic-to-remove".into(),
-        expected_oid: "1".repeat(40),
-        keeper_ref: "refs/heads/retained-topic".into(),
-        keeper_oid: "2".repeat(40),
+    let oid = "1".repeat(40);
+    let facts = ReviewedDeletionFacts {
+        repository_identity: "example/repository".into(),
+        actual_default_branch: RefAssertion {
+            reference: "refs/heads/main".into(),
+            expected: RefState::Present(oid.clone()),
+        },
+        main_branch: RefAssertion {
+            reference: "refs/heads/main".into(),
+            expected: RefState::Present(oid.clone()),
+        },
+        master_branch: RefAssertion {
+            reference: "refs/heads/master".into(),
+            expected: RefState::Absent,
+        },
+        protections_and_rulesets_reviewed: true,
+        server_rejects_active_default_branch_deletion: true,
+        pull_request_heads_and_bases_reviewed: true,
+        keep_patterns_reviewed: true,
+        retention_anchors: vec![RetentionAnchor {
+            reference: "refs/heads/retention-anchor".into(),
+            expected_oid: oid.clone(),
+            retained_candidate_oids: vec![oid.clone()],
+            retention_is_server_enforced: true,
+        }],
+        eligible_candidates: vec![BranchCandidate {
+            reference: "refs/heads/candidate".into(),
+            expected_oid: oid.clone(),
+        }],
     };
-    let remote = "https://example.invalid/owner/repository.git";
-    let current = delete_candidates_if_unchanged(remote, &[candidate.clone()]);
-    #[allow(deprecated)]
-    let legacy = conditional_delete::delete_if_unchanged(
-        remote,
-        &candidate.remote_ref,
-        &candidate.expected_oid,
-        &candidate.keeper_ref,
-        &candidate.keeper_oid,
-    );
+    let scope = unsafe { VerifiedDeletionScope::attest(facts) }.unwrap();
+    let destination =
+        ValidatedDestination::github_https("https://github.com/example/repository.git").unwrap();
+    let valid_ref = "refs/heads/candidate";
+    let invalid_cases = [
+        (
+            vec![BranchCandidate {
+                reference: "refs/tags/forbidden".into(),
+                expected_oid: oid.clone(),
+            }],
+            "refs/heads/*",
+        ),
+        (
+            vec![BranchCandidate {
+                reference: valid_ref.into(),
+                expected_oid: "not-an-object-id".into(),
+            }],
+            "full lowercase",
+        ),
+        (
+            vec![
+                BranchCandidate {
+                    reference: valid_ref.into(),
+                    expected_oid: oid.clone(),
+                },
+                BranchCandidate {
+                    reference: valid_ref.into(),
+                    expected_oid: oid.clone(),
+                },
+            ],
+            "duplicate candidate",
+        ),
+        (
+            vec![BranchCandidate {
+                reference: valid_ref.into(),
+                expected_oid: "2".repeat(40),
+            }],
+            "no verified durable retention anchor",
+        ),
+        (
+            vec![BranchCandidate {
+                reference: "refs/heads/main".into(),
+                expected_oid: oid.clone(),
+            }],
+            "protected or retention ref",
+        ),
+        (
+            vec![BranchCandidate {
+                reference: "refs/heads/pull-request-head".into(),
+                expected_oid: oid.clone(),
+            }],
+            "does not exactly match the reviewed eligible",
+        ),
+    ];
+    for (candidates, expected_error) in invalid_cases {
+        let error = delete_branches_if_unchanged(&destination, &scope, &candidates)
+            .expect_err("invalid candidate set must be rejected");
+        assert!(error.message.contains(expected_error), "{error}");
+        assert!(!error.outcome_ambiguous);
+    }
 
     if let Some(path) = old_path {
         unsafe { std::env::set_var("PATH", path) };
@@ -57,12 +134,5 @@ fn both_delete_apis_fail_closed_without_invoking_git() {
         unsafe { std::env::remove_var("FNR_GIT_CALLED") };
     }
 
-    for result in [current, legacy] {
-        let error = result.expect_err("remote branch deletion must be disabled by policy");
-        assert!(
-            error.contains("disabled by policy"),
-            "unexpected error: {error}"
-        );
-    }
-    assert!(!marker.exists(), "disabled APIs invoked git");
+    assert!(!marker.exists(), "invalid input invoked git");
 }
