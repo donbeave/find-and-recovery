@@ -485,6 +485,14 @@ fn inventory_worktree(
                         "dist",
                         "build",
                         "cache",
+                        "debug",
+                        "release",
+                        "incremental",
+                        "deps",
+                        "shots",
+                        "snapshots",
+                        "artifacts",
+                        "coverage",
                     ]
                     .iter()
                     .any(|excluded| name.eq_ignore_ascii_case(excluded))
