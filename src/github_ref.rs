@@ -22,7 +22,30 @@ enum PushTransport {
 }
 
 #[cfg(unix)]
-const SAFE_GITHUB_SSH_COMMAND: &str = "ssh -F /dev/null -o BatchMode=yes -o CanonicalizeHostname=no -o PermitLocalCommand=no -o ProxyCommand=none -o ProxyJump=none -o ConnectTimeout=10";
+const SAFE_GITHUB_SSH_OPTIONS: &[&str] = &[
+    "-F",
+    "/dev/null",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "HostName=github.com",
+    "-o",
+    "User=git",
+    "-o",
+    "Port=22",
+    "-o",
+    "HostKeyAlias=github.com",
+    "-o",
+    "CanonicalizeHostname=no",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "ProxyCommand=none",
+    "-o",
+    "ProxyJump=none",
+    "-o",
+    "ConnectTimeout=10",
+];
 
 /// Upload exact local commits and atomically create absent recovery refs.
 /// Each empty force-with-lease is an expected-old-zero condition for its exact
@@ -271,23 +294,23 @@ fn reject_local_credential_helpers(repo: &std::path::Path) -> Result<(), String>
 
 fn reject_configured_push_options(repo: &std::path::Path) -> Result<(), String> {
     let output = git_repo_command(repo)
-        .args([
-            "config",
-            "--show-scope",
-            "--name-only",
-            "--get-regexp",
-            r"^push\.pushoption$",
-        ])
+        .args(["config", "--show-scope", "--name-only", "--list"])
         .output()
         .map_err(|_| "could not inspect Git push option configuration".to_owned())?;
-    if output.status.success() && !output.stdout.is_empty() {
-        return Err("recovery push blocked by configured Git push options".into());
-    }
-    if output.status.code() == Some(1) {
-        return Ok(());
-    }
     if !output.status.success() {
         return Err("could not inspect Git push option configuration".into());
+    }
+    let entries = String::from_utf8(output.stdout)
+        .map_err(|_| "could not inspect Git push option configuration")?;
+    for entry in entries.lines() {
+        let Some((_scope, key)) = entry.split_once('\t') else {
+            return Err("could not inspect Git push option configuration".into());
+        };
+        let key = key.to_ascii_lowercase();
+        if key == "push.pushoption" || (key.starts_with("remote.") && key.ends_with(".pushoption"))
+        {
+            return Err("recovery push blocked by configured Git push options".into());
+        }
     }
     Ok(())
 }
@@ -556,12 +579,47 @@ fn apply_safe_transport(command: &mut Command, transport: PushTransport) -> Resu
     if transport == PushTransport::GitHubSsh {
         #[cfg(unix)]
         command
-            .env("GIT_SSH_COMMAND", SAFE_GITHUB_SSH_COMMAND)
+            .env("GIT_SSH_COMMAND", safe_github_ssh_command()?)
             .env("GIT_SSH_VARIANT", "ssh");
         #[cfg(not(unix))]
         return Err("safe GitHub SSH recovery push is unavailable on this platform".into());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn trusted_github_ssh_binary() -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ssh = std::path::Path::new("/usr/bin/ssh")
+        .canonicalize()
+        .map_err(|_| "trusted system OpenSSH is unavailable".to_owned())?;
+    let metadata = ssh
+        .metadata()
+        .map_err(|_| "trusted system OpenSSH is unavailable".to_owned())?;
+    if !ssh.is_absolute() || !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err("trusted system OpenSSH is unavailable".into());
+    }
+    let ssh_text = ssh
+        .to_str()
+        .ok_or_else(|| "trusted system OpenSSH path is invalid".to_owned())?;
+    if ssh_text.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err("trusted system OpenSSH path is invalid".into());
+    }
+    Ok(ssh)
+}
+
+#[cfg(unix)]
+fn safe_github_ssh_command() -> Result<String, String> {
+    let ssh = trusted_github_ssh_binary()?;
+    let ssh = ssh
+        .to_str()
+        .ok_or_else(|| "trusted system OpenSSH path is invalid".to_owned())?;
+    let quoted_ssh = format!("'{}'", ssh.replace('\'', "'\\''"));
+    Ok(format!(
+        "{quoted_ssh} {}",
+        SAFE_GITHUB_SSH_OPTIONS.join(" ")
+    ))
 }
 
 fn git_repo_command(repo: &std::path::Path) -> Command {
@@ -1050,6 +1108,15 @@ mod tests {
             "push.pushOption",
             "release=unsafe-test",
         ]);
+        command(&[
+            "git",
+            "-C",
+            work.to_str().unwrap(),
+            "config",
+            "--add",
+            "Push.PushOption",
+            "uppercase-key=unsafe-test",
+        ]);
 
         let error = push_data_create_only_batch(
             bare.to_str().unwrap(),
@@ -1332,57 +1399,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn github_ssh_push_ignores_user_ssh_config_redirections() {
-        if let (Ok(work), Ok(remote), Ok(oid)) = (
-            std::env::var("GITHUB_REF_TEST_SSH_CONFIG_WORK"),
-            std::env::var("GITHUB_REF_TEST_SSH_CONFIG_REMOTE"),
-            std::env::var("GITHUB_REF_TEST_SSH_CONFIG_OID"),
-        ) {
-            let result = push_data_create_only_batch(
-                &remote,
-                Path::new(&work),
-                &[("refs/heads/recovery/ssh-config-safe".into(), oid)],
-            );
-            assert!(
-                result.is_err(),
-                "test SSH wrapper should reject the connection"
-            );
-            return;
-        }
-
+    fn github_ssh_uses_pinned_binary_and_ignores_user_config_and_path() {
         use std::os::unix::fs::PermissionsExt;
 
-        let (temp, _, _) = bare_remote();
-        let work = temp.path().join("work");
-        let oid = commit_tip(&work, "ssh-config.txt", "payload\n");
-        command(&[
-            "git",
-            "-C",
-            work.to_str().unwrap(),
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:owner/repo.git",
-        ]);
-
+        let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let ssh_dir = home.join(".ssh");
         fs::create_dir_all(&ssh_dir).unwrap();
         let match_marker = temp.path().join("ssh-match-exec-ran");
         let proxy_marker = temp.path().join("ssh-proxy-command-ran");
         let ssh_config = format!(
-            "Match exec \"/bin/touch {}\"\n    HostName 127.0.0.1\n\nHost github.com\n    ProxyCommand /bin/touch {}\n",
+            "Match exec \"/bin/touch {}\"\n    HostName 127.0.0.1\n    User attacker\n    Port 2222\n\nHost github.com\n    HostName 192.0.2.123\n    User attacker\n    Port 2222\n    ProxyCommand /bin/touch {}\n    ProxyJump attacker@192.0.2.123\n",
             match_marker.display(),
             proxy_marker.display()
         );
         fs::write(ssh_dir.join("config"), ssh_config).unwrap();
 
-        let mut ssh_words = SAFE_GITHUB_SSH_COMMAND.split_whitespace();
-        let ssh_program = ssh_words.next().unwrap();
-        let ssh_config = Command::new(ssh_program)
-            .args(ssh_words)
+        let fake_bin = temp.path().join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let path_marker = temp.path().join("path-ssh-ran");
+        let fake_ssh = fake_bin.join("ssh");
+        fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 71\n",
+                path_marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_ssh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_ssh, permissions).unwrap();
+        let hostile_path = std::env::join_paths([&fake_bin]).unwrap();
+
+        let pinned_ssh = std::path::Path::new("/usr/bin/ssh")
+            .canonicalize()
+            .expect("system OpenSSH must be installed for this test");
+        assert_eq!(trusted_github_ssh_binary().unwrap(), pinned_ssh);
+        let safe_command = safe_github_ssh_command().unwrap();
+        assert!(
+            safe_command.starts_with(&format!("'{}' ", pinned_ssh.display())),
+            "Git must execute the pinned absolute SSH binary: {safe_command}"
+        );
+
+        let ssh_config = Command::new(&pinned_ssh)
+            .args(SAFE_GITHUB_SSH_OPTIONS)
             .args(["-G", "git@github.com"])
             .env("HOME", &home)
+            .env("PATH", &hostile_path)
             .output()
             .unwrap();
         assert!(
@@ -1392,6 +1456,13 @@ mod tests {
         );
         let ssh_config = String::from_utf8_lossy(&ssh_config.stdout);
         assert!(ssh_config.lines().any(|line| line == "hostname github.com"));
+        assert!(ssh_config.lines().any(|line| line == "user git"));
+        assert!(ssh_config.lines().any(|line| line == "port 22"));
+        assert!(
+            ssh_config
+                .lines()
+                .any(|line| line == "hostkeyalias github.com")
+        );
         assert!(
             ssh_config
                 .lines()
@@ -1408,55 +1479,7 @@ mod tests {
         );
         assert!(!match_marker.exists(), "OpenSSH Match exec ran");
         assert!(!proxy_marker.exists(), "OpenSSH ProxyCommand ran");
-
-        let fake_bin = temp.path().join("bin");
-        fs::create_dir_all(&fake_bin).unwrap();
-        let ssh_log = temp.path().join("ssh-wrapper-args");
-        let wrapper = fake_bin.join("ssh");
-        fs::write(
-            &wrapper,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$SSH_WRAPPER_LOG\"\nexit 71\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&wrapper, permissions).unwrap();
-        let mut paths = vec![fake_bin];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        let path = std::env::join_paths(paths).unwrap();
-
-        let child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "github_ref::tests::github_ssh_push_ignores_user_ssh_config_redirections",
-            ])
-            .env("GITHUB_REF_TEST_SSH_CONFIG_WORK", &work)
-            .env("GITHUB_REF_TEST_SSH_CONFIG_REMOTE", "origin")
-            .env("GITHUB_REF_TEST_SSH_CONFIG_OID", &oid)
-            .env("SSH_WRAPPER_LOG", &ssh_log)
-            .env("HOME", &home)
-            .env("PATH", path)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_SSH")
-            .env_remove("GIT_SSH_COMMAND")
-            .env_remove("GIT_PROXY_COMMAND")
-            .output()
-            .unwrap();
-        assert!(
-            child.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&child.stderr)
-        );
-        let wrapper_args = fs::read_to_string(ssh_log).unwrap();
-        assert!(wrapper_args.contains("-F\n/dev/null\n"), "{wrapper_args}");
-        assert!(
-            wrapper_args.contains("ProxyCommand=none") && wrapper_args.contains("ProxyJump=none"),
-            "{wrapper_args}"
-        );
-        assert!(!match_marker.exists(), "OpenSSH Match exec ran");
-        assert!(!proxy_marker.exists(), "OpenSSH ProxyCommand ran");
+        assert!(!path_marker.exists(), "PATH-supplied SSH binary ran");
     }
 
     #[cfg(unix)]
